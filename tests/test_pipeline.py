@@ -7,6 +7,8 @@ every dropped lead must be traceable to the stage that dropped it.
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Sequence
 from typing import Any
 
@@ -15,10 +17,11 @@ import pytest
 from src.config import FilterSettings, Settings, load_settings
 from src.crawlers.base import BaseCrawler
 from src.models.enums import DedupStrategy, RejectionReason, SeniorityLevel
-from src.models.lead import RawLead
+from src.models.lead import RawLead, StandardizedLead
 from src.models.results import MAX_RECORDED_REJECTIONS, CrawlResult
 from src.processors import Pipeline
 from src.processors.filters import LeadFilter
+from src.processors.validator import LeadValidator
 from src.utils.errors import CrawlerError, SourceAuthError, SourceUnavailableError
 from tests.conftest import make_raw_lead
 
@@ -379,3 +382,156 @@ class TestInjectedStages:
         )
         assert len(result.leads) == 1
         assert result.stats.per_filter_reason == {"require_linkedin": 1}
+
+
+class ExplodingValidator(LeadValidator):
+    """A stage that fails on one specific record, as a real bug would."""
+
+    def __init__(self, bad_full_name: str) -> None:
+        self.bad_full_name = bad_full_name
+
+    def validate(self, lead: StandardizedLead) -> Any:
+        if lead.person.full_name == self.bad_full_name:
+            raise RuntimeError("validator exploded")
+        return super().validate(lead)
+
+
+class ExplodingFilter(LeadFilter):
+    """A filter whose rule raises for one specific record."""
+
+    def __init__(
+        self, criteria: FilterSettings, bad_full_name: str, *, min_completeness: float = 0.0
+    ) -> None:
+        super().__init__(criteria, min_completeness=min_completeness)
+        self.bad_full_name = bad_full_name
+
+    def evaluate(self, lead: StandardizedLead) -> Any:
+        if lead.person.full_name == self.bad_full_name:
+            raise RuntimeError("filter exploded")
+        return super().evaluate(lead)
+
+
+class TestPerRecordIsolation:
+    """One bad record must cost one lead, never the run."""
+
+    async def test_a_raising_validator_is_contained(self, settings: Settings) -> None:
+        pipeline = Pipeline(settings, validator=ExplodingValidator("Ada Lovelace"))
+        result = await pipeline.run(
+            [
+                FakeCrawler(
+                    settings,
+                    [
+                        rich_raw(),
+                        sparse_raw(),
+                        rich_raw(
+                            external_id="other",
+                            email="alan@bletchley.example.com",
+                            first_name="Alan",
+                            last_name="Turing",
+                            company_name="Bletchley Park",
+                            company_domain="bletchley.example.com",
+                        ),
+                    ],
+                )
+            ],
+            limit=10,
+        )
+
+        # The two healthy records survived; only the poisoned one was lost.
+        assert len(result.leads) == 2
+        assert result.stats.processing_failed == 1
+        rejection = next(
+            item for item in result.rejections if item.reason is RejectionReason.PROCESSING_FAILED
+        )
+        assert rejection.detail == "validator exploded"
+
+    async def test_a_raising_filter_is_contained(self, settings: Settings) -> None:
+        pipeline = Pipeline(
+            settings,
+            lead_filter=ExplodingFilter(
+                settings.filters,
+                "Ada Lovelace",
+                min_completeness=settings.min_completeness,
+            ),
+        )
+        result = await pipeline.run([FakeCrawler(settings, [rich_raw(), sparse_raw()])], limit=10)
+
+        assert len(result.leads) == 1
+        assert result.stats.processing_failed == 1
+        # A processor bug is not miscounted as bad input.
+        assert result.stats.validation_failed == 0
+        assert result.stats.normalization_failed == 0
+
+    async def test_a_processing_failure_counts_toward_the_totals(self, settings: Settings) -> None:
+        pipeline = Pipeline(settings, validator=ExplodingValidator("Ada Lovelace"))
+        result = await pipeline.run([FakeCrawler(settings, [rich_raw()])], limit=10)
+
+        assert result.is_empty
+        assert result.stats.total_rejected == 1
+        assert result.stats.records_invalid == 1
+        assert result.stats.normalized == 1  # it parsed fine; a later stage broke
+
+
+class TestRunSummaryLog:
+    """The nine fields an operator needs from a single record."""
+
+    REQUIRED = (
+        "sources",
+        "started_at",
+        "finished_at",
+        "records_discovered",
+        "records_parsed",
+        "records_invalid",
+        "duplicates_removed",
+        "records_exported",
+        "errors",
+    )
+
+    async def test_the_record_carries_every_required_field(
+        self, settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger="src.processors.pipeline"):
+            result = await run_pipeline(settings, [FakeCrawler(settings, [rich_raw()])])
+
+        summaries = [r for r in caplog.records if r.getMessage() == "run summary"]
+        assert len(summaries) == 1, "the run summary must be emitted exactly once"
+
+        fields = summaries[0].__dict__
+        missing = [name for name in self.REQUIRED if name not in fields]
+        assert missing == [], f"run summary is missing {missing}"
+
+        assert fields["sources"] == ["fake"]
+        assert fields["records_discovered"] == 1
+        assert fields["records_parsed"] == 1
+        assert fields["records_exported"] == result.stats.exported
+        assert fields["errors"] == {}
+
+    async def test_errors_are_reported_per_source(
+        self, settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger="src.processors.pipeline"):
+            await run_pipeline(
+                settings,
+                [
+                    FakeCrawler(
+                        settings, error=CrawlerError("dead", "connection refused"), provider="dead"
+                    ),
+                    FakeCrawler(settings, [rich_raw("ok")], provider="ok"),
+                ],
+            )
+
+        summary = next(r for r in caplog.records if r.getMessage() == "run summary")
+        assert "connection refused" in summary.__dict__["errors"]["dead"]
+        # The healthy source is still named, so the record says what did run.
+        assert summary.__dict__["sources"] == ["dead", "ok"]
+
+    async def test_the_record_is_json_serializable(
+        self, settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The fields must survive --log-format json, which json.dumps the extras.
+        with caplog.at_level(logging.INFO, logger="src.processors.pipeline"):
+            await run_pipeline(settings, [FakeCrawler(settings, [rich_raw()])])
+
+        summary = next(r for r in caplog.records if r.getMessage() == "run summary")
+        extras = {k: v for k, v in summary.__dict__.items() if k in self.REQUIRED}
+        assert json.loads(json.dumps(extras, default=str))["records_discovered"] == 1

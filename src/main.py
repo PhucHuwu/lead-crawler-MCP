@@ -136,8 +136,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- Output -------------------------------------------------------- #
     output = parser.add_argument_group("output")
-    output.add_argument(
-        "-o", "--output-dir", type=Path, metavar="DIR", help="Where to write exports."
+    destination = output.add_mutually_exclusive_group()
+    destination.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Write the export to this exact file. Requires a single --format; "
+            "use --output-dir for the timestamped multi-format layout."
+        ),
+    )
+    destination.add_argument(
+        "--output-dir",
+        type=Path,
+        metavar="DIR",
+        help="Directory for timestamped exports (default: LEAD_OUTPUT_DIR).",
     )
     output.add_argument(
         "-f",
@@ -202,7 +216,14 @@ def build_parser() -> argparse.ArgumentParser:
     runtime.add_argument(
         "--config", type=Path, metavar="PATH", help="Path to a .env file (default: ./.env)."
     )
-    runtime.add_argument("--log-level", choices=_LOG_LEVELS, help="Logging verbosity.")
+    verbosity = runtime.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Shorthand for --log-level DEBUG.",
+    )
+    verbosity.add_argument("--log-level", choices=_LOG_LEVELS, help="Logging verbosity.")
     runtime.add_argument(
         "--log-format", choices=[fmt.value for fmt in LogFormat], help="Log rendering style."
     )
@@ -260,7 +281,9 @@ def _filter_overrides(args: argparse.Namespace) -> dict[str, Any]:
 def build_settings(args: argparse.Namespace) -> Settings:
     """Merge CLI flags over the environment."""
     overrides: dict[str, Any] = {
-        "log_level": args.log_level,
+        # --verbose is sugar for the one log level it names; the two are mutually
+        # exclusive at the parser, so there is no precedence question to resolve.
+        "log_level": "DEBUG" if args.verbose else args.log_level,
         "log_format": args.log_format,
         "output_dir": args.output_dir,
         "output_prefix": args.output_prefix,
@@ -356,7 +379,6 @@ def _print_summary(result: CrawlResult, outputs: Sequence[Path], *, dry_run: boo
 # --------------------------------------------------------------------------- #
 async def _run(args: argparse.Namespace, settings: Settings) -> int:
     from src.crawlers import available_providers, build_crawler
-    from src.exporters import build_exporter, write_run_report
     from src.processors import Pipeline
 
     logger = get_logger("main")
@@ -375,6 +397,35 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
     crawlers = [build_crawler(name, settings) for name in requested]
     limit = args.limit or settings.default_limit
 
+    # Fail on a contradictory output request before paying for the crawl.
+    _check_output_target(args, settings)
+
+    # At DEBUG only: which flags and environment values actually won. This is the
+    # first thing to look at when a run behaves unlike the command line suggests,
+    # and it deliberately lists fields rather than dumping the settings tree so
+    # no credential can reach the log.
+    get_logger("main").debug(
+        "effective configuration",
+        extra={
+            "sources": requested,
+            "limit": limit,
+            "max_leads": args.max_leads,
+            "formats": [fmt.value for fmt in settings.active_formats()],
+            # Whichever of the two destinations actually wins, so the record
+            # cannot claim a directory the run is not going to write to.
+            "output": str(args.output) if args.output is not None else None,
+            "output_dir": str(settings.output_dir),
+            "output_prefix": settings.output_prefix,
+            "dedup": settings.dedup_strategy.value,
+            "min_completeness": settings.min_completeness,
+            "sort_by_completeness": settings.sort_by_completeness,
+            "filters_active": settings.filters.is_active,
+            "max_concurrency": settings.max_concurrency,
+            "http_max_attempts": settings.http_max_attempts,
+            "write_run_report": settings.write_run_report,
+        },
+    )
+
     try:
         result = await Pipeline(settings).run(crawlers, limit=limit, max_leads=args.max_leads)
     finally:
@@ -391,25 +442,89 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
 
     outputs: list[Path] = []
     if not args.dry_run:
-        directory = settings.ensure_output_dir()
-        timestamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
-        for fmt in settings.active_formats():
-            exporter = build_exporter(fmt, settings)
-            path = exporter.build_path(directory, settings.output_prefix, timestamp)
-            export_result = await exporter.export(result.leads, path)
-            outputs.append(export_result.path)
-            result.stats.output_files.append(str(export_result.path))
-            logger.info("exported leads", extra={"format": fmt.value, "path": str(path)})
-
-        if settings.write_run_report:
-            report_path = directory / f"{settings.output_prefix}_{timestamp}_report.json"
-            outputs.append(await write_run_report(result, report_path, settings, limit=limit))
+        outputs = await _export(args, settings, result, limit=limit)
 
     _print_summary(result, outputs, dry_run=args.dry_run)
 
     if args.fail_on_empty and not result.leads:
         return EXIT_EMPTY
     return EXIT_OK
+
+
+def _check_output_target(args: argparse.Namespace, settings: Settings) -> None:
+    """Reject an ``--output`` target that cannot hold what was requested.
+
+    An explicit path names exactly one file, so it can carry exactly one format.
+    Checked before any crawling so a contradictory invocation fails immediately
+    rather than after paying for the whole run.
+
+    Raises:
+        ConfigError: if ``--output`` was given alongside several formats.
+    """
+    if args.output is None:
+        return
+    formats = settings.active_formats()
+    if len(formats) > 1:
+        requested = ", ".join(fmt.value for fmt in formats)
+        raise ConfigError(
+            f"--output writes a single file, but {len(formats)} formats were "
+            f"requested ({requested}); pass one --format or use --output-dir"
+        )
+
+
+async def _export(
+    args: argparse.Namespace,
+    settings: Settings,
+    result: CrawlResult,
+    *,
+    limit: int,
+) -> list[Path]:
+    """Write the requested exports and return the paths written.
+
+    Two layouts, chosen by the flag the user passed:
+
+    ``--output PATH``      exactly that file, next to a ``<stem>_report.json``.
+    ``--output-dir DIR``   ``<prefix>_<timestamp>.<ext>`` per format, timestamped
+                           so successive runs accumulate instead of overwriting.
+    """
+    from src.exporters import build_exporter, write_run_report
+
+    _check_output_target(args, settings)
+
+    logger = get_logger("main")
+    formats = settings.active_formats()
+    outputs: list[Path] = []
+    timestamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+    if args.output is not None:
+        directory = args.output.parent
+        fixed_path: Path | None = args.output
+        report_path = args.output.with_name(f"{args.output.stem}_report.json")
+    else:
+        directory = settings.ensure_output_dir()
+        fixed_path = None
+        report_path = directory / f"{settings.output_prefix}_{timestamp}_report.json"
+
+    for fmt in formats:
+        exporter = build_exporter(fmt, settings)
+        path = fixed_path or exporter.build_path(directory, settings.output_prefix, timestamp)
+        export_result = await exporter.export(result.leads, path)
+        outputs.append(export_result.path)
+        result.stats.output_files.append(str(export_result.path))
+        logger.info(
+            "exported leads",
+            extra={
+                "format": fmt.value,
+                "path": str(export_result.path),
+                "records": export_result.records,
+                "bytes": export_result.bytes_written,
+            },
+        )
+
+    if settings.write_run_report:
+        outputs.append(await write_run_report(result, report_path, settings, limit=limit))
+
+    return outputs
 
 
 def cli(argv: Sequence[str] | None = None) -> int:
@@ -419,7 +534,10 @@ def cli(argv: Sequence[str] | None = None) -> int:
 
     # Logging is configured before anything can fail, so config errors are logged
     # in the format the caller asked for.
-    configure_logging(args.log_level or "INFO", args.log_format or LogFormat.CONSOLE.value)
+    configure_logging(
+        "DEBUG" if args.verbose else (args.log_level or "INFO"),
+        args.log_format or LogFormat.CONSOLE.value,
+    )
 
     if args.list_sources:
         _print_sources()

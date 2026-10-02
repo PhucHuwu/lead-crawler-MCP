@@ -114,17 +114,7 @@ class Pipeline:
         stats.exported = len(ordered)
         stats.finalize()
 
-        logger.info(
-            "pipeline finished",
-            extra={
-                "raw": stats.raw_collected,
-                "kept": len(ordered),
-                "filtered": stats.filtered_out,
-                "duplicates": stats.duplicates_removed,
-                "invalid": stats.validation_failed,
-                "duration_s": stats.duration_seconds,
-            },
-        )
+        self._log_run_summary(stats)
 
         return CrawlResult(
             leads=ordered,
@@ -189,7 +179,12 @@ class Pipeline:
         stats: CrawlStats,
         rejections: list[RejectedLead],
     ) -> list[StandardizedLead]:
-        """Run each raw lead through normalization, validation and filtering."""
+        """Run each raw lead through normalization, validation and filtering.
+
+        Every record is processed in isolation: an exception raised anywhere in the
+        chain is recorded against *that* record and the run continues. Only a
+        source-level failure can end a run early.
+        """
         processed: list[StandardizedLead] = []
 
         for raw in raw_leads:
@@ -216,43 +211,108 @@ class Pipeline:
 
             stats.normalized += 1
 
-            outcome = self.validator.validate(lead)
-            if not outcome.is_valid:
-                stats.validation_failed += 1
+            try:
+                keep = self._evaluate(lead, raw, stats=stats, rejections=rejections)
+            except Exception as exc:
+                # A bug in a downstream stage is contained the same way bad input
+                # is — one record is lost, the run is not.
+                stats.processing_failed += 1
                 self._record_rejection(
                     rejections,
                     RejectedLead(
                         provider=lead.source.provider,
                         label=raw.label(),
-                        reason=RejectionReason.VALIDATION_FAILED,
-                        detail=outcome.summary(),
+                        reason=RejectionReason.PROCESSING_FAILED,
+                        detail=str(exc),
                         external_id=lead.source.external_id,
                     ),
                 )
-                continue
-
-            decision = self.lead_filter.evaluate(lead)
-            if not decision.passed:
-                stats.record_filter(decision.rule or "unknown")
-                self._record_rejection(
-                    rejections,
-                    RejectedLead(
-                        provider=lead.source.provider,
-                        label=raw.label(),
-                        reason=RejectionReason.FILTERED_OUT,
-                        detail=decision.detail,
-                        external_id=lead.source.external_id,
-                    ),
+                logger.warning(
+                    "processing failed",
+                    extra={
+                        "provider": lead.source.provider,
+                        "label": raw.label(),
+                        "error": str(exc),
+                    },
                 )
                 continue
 
-            processed.append(lead)
+            if keep:
+                processed.append(lead)
 
         return processed
+
+    def _evaluate(
+        self,
+        lead: StandardizedLead,
+        raw: RawLead,
+        *,
+        stats: CrawlStats,
+        rejections: list[RejectedLead],
+    ) -> bool:
+        """Validate and filter one normalized lead. True when it should be kept."""
+        outcome = self.validator.validate(lead)
+        if not outcome.is_valid:
+            stats.validation_failed += 1
+            self._record_rejection(
+                rejections,
+                RejectedLead(
+                    provider=lead.source.provider,
+                    label=raw.label(),
+                    reason=RejectionReason.VALIDATION_FAILED,
+                    detail=outcome.summary(),
+                    external_id=lead.source.external_id,
+                ),
+            )
+            return False
+
+        decision = self.lead_filter.evaluate(lead)
+        if not decision.passed:
+            stats.record_filter(decision.rule or "unknown")
+            self._record_rejection(
+                rejections,
+                RejectedLead(
+                    provider=lead.source.provider,
+                    label=raw.label(),
+                    reason=RejectionReason.FILTERED_OUT,
+                    detail=decision.detail,
+                    external_id=lead.source.external_id,
+                ),
+            )
+            return False
+
+        return True
 
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+    def _log_run_summary(self, stats: CrawlStats) -> None:
+        """Emit one structured record describing the whole run.
+
+        This is the record an operator greps for: emitted exactly once per run,
+        carrying every figure needed to answer "what did the crawl actually do?"
+        without correlating several lines. With ``--log-format json`` each field
+        below becomes a top-level JSON key.
+        """
+        logger.info(
+            "run summary",
+            extra={
+                # Every source the run touched, whether it produced anything or
+                # failed; ``errors`` below says which of them went wrong.
+                "sources": sorted(set(stats.per_provider) | set(stats.source_errors)),
+                "started_at": stats.started_at.isoformat(),
+                "finished_at": stats.finished_at.isoformat() if stats.finished_at else None,
+                "records_discovered": stats.raw_collected,
+                "records_parsed": stats.normalized,
+                "records_invalid": stats.records_invalid,
+                "records_filtered": stats.filtered_out,
+                "duplicates_removed": stats.duplicates_removed,
+                "records_exported": stats.exported,
+                "errors": stats.source_errors or {},
+                "duration_seconds": stats.duration_seconds,
+            },
+        )
+
     def _sort(self, leads: list[StandardizedLead]) -> list[StandardizedLead]:
         """Order leads best-first.
 
@@ -264,6 +324,20 @@ class Pipeline:
         return sorted(leads, key=lambda lead: (-lead.completeness, lead.lead_id))
 
     def _record_rejection(self, rejections: list[RejectedLead], rejection: RejectedLead) -> None:
-        """Append a rejection record, respecting the retention cap."""
+        """Append a rejection record, respecting the retention cap.
+
+        Also logged at DEBUG: a run that returns fewer leads than expected is
+        almost always explained by these lines, and they are far too numerous to
+        belong in a normal run's log.
+        """
+        logger.debug(
+            "lead rejected",
+            extra={
+                "provider": rejection.provider,
+                "label": rejection.label,
+                "reason": rejection.reason.value,
+                "detail": rejection.detail,
+            },
+        )
         if len(rejections) < self._max_rejections:
             rejections.append(rejection)

@@ -50,8 +50,10 @@ lead-crawler --source apollo --limit 100
 ```
 
 Output lands in `data/exports/` as `<prefix>_<UTC timestamp>.<ext>` plus a
-`_report.json` run report. Logs go to **stderr**, the run summary to **stdout**,
-so `--log-format json` composes cleanly with a shell pipeline.
+`_report.json` run report; `--output` overrides that with an exact path (see
+[Where the output goes](#where-the-output-goes)). Logs go to **stderr**, the run
+summary to **stdout**, so `--log-format json` composes cleanly with a shell
+pipeline.
 
 ---
 
@@ -117,16 +119,25 @@ never clobbers an environment value (`--flag` / `--no-flag` pairs default to
 **3. Failures are contained and attributed.** Sources are crawled concurrently.
 A source that raises — even an untyped `RuntimeError` from a third-party library
 — is recorded in `stats.source_errors` and the run continues with the survivors.
-Every dropped lead is attributed to the stage that dropped it
-(`validation_failed` / `filtered_out` / `duplicate`) with a reason, so "why is
+The same containment applies per record: an exception from normalization,
+validation or filtering drops *that* lead and nothing else, so one malformed row
+can never cost you the other 999. Every dropped lead is attributed to the stage
+that dropped it (`normalization_failed` / `processing_failed` /
+`validation_failed` / `filtered_out` / `duplicate`) with a reason, so "why is
 this lead missing?" is answerable from the run report.
 
-**4. Determinism where it is free.** Lead IDs are SHA-256 digests of the
+**4. One record per run.** When the crawl finishes, the pipeline logs a single
+`run summary` record carrying the source list, start and end times, records
+discovered, parsed, invalid, filtered, de-duplicated and exported, plus any
+per-source errors. With `--log-format json` each of those is a top-level key, so
+a log pipeline can index a whole run without parsing prose.
+
+**5. Determinism where it is free.** Lead IDs are SHA-256 digests of the
 identity keys, so the same input yields the same IDs across runs. That is what
 makes a later phase able to diff two runs and see what changed. The `mock`
 source is seeded for the same reason.
 
-**5. Atomic writes.** Exports go to a sibling temp file and are renamed into
+**6. Atomic writes.** Exports go to a sibling temp file and are renamed into
 place, so a crash or a full disk never leaves a half-written file that looks
 valid.
 
@@ -140,8 +151,11 @@ Run `python -m src.main --help` for the full surface. The common cases:
 # Built-in demo data, default formats (csv + json) into data/exports/.
 python -m src.main --source mock --limit 100
 
-# CSV in, CSV out, output elsewhere.
-python -m src.main -s csv --csv-path leads.csv -o out/ -f csv
+# The full example: one source, one file, one format.
+python -m src.main --source apollo --limit 100 --format json --output ./output/leads.json
+
+# CSV in, CSV out, timestamped into a directory.
+python -m src.main -s csv --csv-path leads.csv --output-dir out/ -f csv
 
 # Several sources in one run; results are merged and de-duplicated across them.
 python -m src.main -s csv,mock --csv-path leads.csv --limit 200
@@ -157,9 +171,32 @@ python -m src.main -s apollo --limit 500 --seniority c_suite,vp,director --max-l
 # Inspect without writing anything.
 python -m src.main -s csv --csv-path leads.csv --dry-run
 
+# Why did this run drop leads? --verbose adds a per-record reason.
+python -m src.main -s apollo --limit 500 --require-email --verbose
+
 # Machine-readable logs for a pipeline.
 python -m src.main -s apollo --log-format json --log-level DEBUG
 ```
+
+### Where the output goes
+
+`--output` and `--output-dir` are mutually exclusive, and the difference matters:
+
+| Flag | Writes | Use it when |
+| ---- | ------ | ----------- |
+| `--output PATH` (`-o`) | Exactly `PATH`, plus `PATH` with `_report` appended | A downstream job knows the path it wants to read |
+| `--output-dir DIR` | `<prefix>_<UTC timestamp>.<ext>` per format | You want to keep every run's output side by side |
+
+`--output` requires a single `--format` — one path cannot hold two
+serializations — and a missing parent directory is created for you. Because the
+default is `csv,json`, `--output` on its own is a configuration error; pass
+`--format` explicitly. With `--output` the run report lands next to your file as
+`<stem>_report.json` rather than being timestamped.
+
+`--verbose` (`-v`) is shorthand for `--log-level DEBUG`. It adds the effective
+configuration (secrets excluded) and one `lead rejected` line per dropped
+record, which is usually the fastest way to find out why a filter removed more
+than you expected. It and `--log-level` are mutually exclusive.
 
 **Exit codes** — for a scheduler or a shell pipeline to branch on:
 

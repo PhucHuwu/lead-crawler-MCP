@@ -144,6 +144,21 @@ class TestCrawlStats:
         stats.duplicates_removed = 1
         assert stats.total_rejected == 6
 
+    def test_total_rejected_counts_processor_failures(self) -> None:
+        # A stage that raised on a record dropped it just as surely as a rule did.
+        stats = CrawlStats()
+        stats.normalization_failed = 1
+        stats.processing_failed = 2
+        assert stats.total_rejected == 3
+
+    def test_records_invalid_sums_the_three_ways_a_record_is_unusable(self) -> None:
+        stats = CrawlStats()
+        stats.normalization_failed = 1
+        stats.processing_failed = 2
+        stats.validation_failed = 3
+        stats.filtered_out = 99  # filtered, not invalid: the record itself was fine
+        assert stats.records_invalid == 6
+
     def test_record_filter_tracks_per_rule(self) -> None:
         stats = CrawlStats()
         stats.record_filter("min_employees")

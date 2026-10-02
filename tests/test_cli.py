@@ -413,6 +413,169 @@ class TestRuns:
         assert list(tmp_path.glob("*_report.json")) == []
 
 
+class TestOutputTarget:
+    """``--output`` names the exact file, unlike ``--output-dir``."""
+
+    def test_output_writes_that_exact_path(self, tmp_path: Path) -> None:
+        target = tmp_path / "leads.json"
+        code = cli(
+            [
+                "--source",
+                "mock",
+                "--limit",
+                "5",
+                "--format",
+                "json",
+                "--output",
+                str(target),
+            ]
+        )
+        assert code == EXIT_OK
+        assert target.is_file()
+        # The JSON exporter writes a bare array of leads.
+        assert len(json.loads(target.read_text(encoding="utf-8"))) == 4
+
+    def test_short_form_is_accepted(self, tmp_path: Path) -> None:
+        target = tmp_path / "short.csv"
+        cli(["--source", "mock", "--limit", "5", "--format", "csv", "-o", str(target)])
+        assert target.is_file()
+
+    def test_no_timestamped_file_is_written(self, tmp_path: Path) -> None:
+        # A caller that named a file gets that file and nothing else.
+        cli(
+            [
+                "--source",
+                "mock",
+                "--limit",
+                "5",
+                "--format",
+                "csv",
+                "--output",
+                str(tmp_path / "plain.csv"),
+            ]
+        )
+        assert written_names(tmp_path) == []
+
+    def test_missing_parent_directories_are_created(self, tmp_path: Path) -> None:
+        target = tmp_path / "deep" / "nested" / "leads.csv"
+        code = cli(
+            [
+                "--source",
+                "mock",
+                "--limit",
+                "5",
+                "--format",
+                "csv",
+                "--output",
+                str(target),
+            ]
+        )
+        assert code == EXIT_OK
+        assert target.is_file()
+
+    def test_run_report_sits_beside_the_output(self, tmp_path: Path) -> None:
+        target = tmp_path / "leads.json"
+        cli(["--source", "mock", "--limit", "5", "--format", "json", "--output", str(target)])
+
+        report = json.loads((tmp_path / "leads_report.json").read_text(encoding="utf-8"))
+        assert report["stats"]["raw_collected"] == 5
+        assert report["outputs"] == [str(target)]
+
+    def test_two_formats_into_one_file_is_a_config_error(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        code = cli(
+            [
+                "--source",
+                "mock",
+                "--format",
+                "csv,json",
+                "--output",
+                str(tmp_path / "leads.out"),
+            ]
+        )
+        assert code == EXIT_CONFIG
+        assert "--output-dir" in capsys.readouterr().err
+
+        # The check runs before any crawling, so a doomed run costs nothing.
+        assert list(tmp_path.iterdir()) == []
+
+    def test_output_and_output_dir_are_mutually_exclusive(self, tmp_path: Path) -> None:
+        with pytest.raises(SystemExit) as excinfo:
+            cli(["--source", "mock", "--output", "a.json", "--output-dir", str(tmp_path)])
+        assert excinfo.value.code == EXIT_CONFIG
+
+    def test_dry_run_ignores_the_output_target(self, tmp_path: Path) -> None:
+        target = tmp_path / "never.csv"
+        code = cli(
+            [
+                "--source",
+                "mock",
+                "--limit",
+                "5",
+                "--format",
+                "csv",
+                "--output",
+                str(target),
+                "--dry-run",
+            ]
+        )
+        assert code == EXIT_OK
+        assert not target.exists()
+
+
+class TestVerbosity:
+    def test_verbose_and_log_level_are_mutually_exclusive(self) -> None:
+        with pytest.raises(SystemExit) as excinfo:
+            cli(["--source", "mock", "--verbose", "--log-level", "INFO"])
+        assert excinfo.value.code == EXIT_CONFIG
+
+    def test_verbose_raises_the_root_logger_to_debug(self, tmp_path: Path) -> None:
+        cli(["--source", "mock", "--limit", "5", "--output-dir", str(tmp_path), "--verbose"])
+        assert logging.getLogger().level == logging.DEBUG
+
+    def test_default_run_stays_at_info(self, tmp_path: Path) -> None:
+        cli(["--source", "mock", "--limit", "5", "--output-dir", str(tmp_path)])
+        assert logging.getLogger().level == logging.INFO
+
+    def test_debug_records_explain_why_leads_were_dropped(
+        self,
+        csv_with_one_email_less_row: Path,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # --verbose is only useful if it actually adds detail. Logs go to stderr.
+        cli(
+            [
+                "--source",
+                "csv",
+                "--csv-path",
+                str(csv_with_one_email_less_row),
+                "--output-dir",
+                str(tmp_path),
+                "--require-email",
+                "--verbose",
+            ]
+        )
+        assert "lead rejected" in capsys.readouterr().err
+
+    def test_verbose_dumps_the_effective_configuration(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cli(["--source", "mock", "--limit", "5", "--output-dir", str(tmp_path), "--verbose"])
+        err = capsys.readouterr().err
+        assert "effective configuration" in err
+        assert "max_concurrency" in err
+
+    def test_verbose_never_logs_a_credential(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        secret = "super-secret-apollo-key"  # noqa: S105 - a fixture value, not a credential
+        monkeypatch.setenv("LEAD_APOLLO__API_KEY", secret)
+        cli(["--source", "mock", "--limit", "5", "--output-dir", str(tmp_path), "--verbose"])
+        assert secret not in capsys.readouterr().err
+
+
 class TestExitCodes:
     def test_empty_result_is_success_by_default(self, tmp_path: Path) -> None:
         empty = tmp_path / "empty.csv"

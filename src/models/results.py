@@ -47,6 +47,8 @@ class CrawlStats(BaseModel):
     raw_collected: int = 0
     normalized: int = 0
     normalization_failed: int = 0
+    #: Records a post-normalization stage (validation, filtering) raised on.
+    processing_failed: int = 0
     validation_failed: int = 0
     filtered_out: int = 0
     duplicates_removed: int = 0
@@ -66,10 +68,21 @@ class CrawlStats(BaseModel):
         """Leads dropped after collection, by any stage."""
         return (
             self.normalization_failed
+            + self.processing_failed
             + self.validation_failed
             + self.filtered_out
             + self.duplicates_removed
         )
+
+    @property
+    def records_invalid(self) -> int:
+        """Raw records that could not be turned into a usable lead.
+
+        The single figure the run log reports as "invalid records": a record that
+        failed to normalize or that a later processor choked on, plus one that
+        normalized cleanly but had no usable identity.
+        """
+        return self.normalization_failed + self.processing_failed + self.validation_failed
 
     @property
     def failed_providers(self) -> list[str]:

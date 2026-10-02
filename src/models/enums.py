@@ -101,6 +101,9 @@ class RejectionReason(StrEnum):
     """Why a lead did not make it into the exported set."""
 
     NORMALIZATION_FAILED = "normalization_failed"
+    #: A later stage (validation, filtering) raised on this record. Distinct from
+    #: ``NORMALIZATION_FAILED`` so a processor bug is not misread as bad input.
+    PROCESSING_FAILED = "processing_failed"
     VALIDATION_FAILED = "validation_failed"
     FILTERED_OUT = "filtered_out"
     DUPLICATE = "duplicate"

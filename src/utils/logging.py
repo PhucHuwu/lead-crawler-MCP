@@ -118,6 +118,9 @@ def configure_logging(level: str = "INFO", fmt: str = "console", *, stream: Any 
         logging.DEBUG if root.level <= logging.DEBUG else logging.WARNING
     )
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # asyncio's DEBUG records ("Using selector: ...") describe its own setup and
+    # say nothing about the crawl, so they stay hidden even under --verbose.
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
 
     _CONFIGURED = True
 
