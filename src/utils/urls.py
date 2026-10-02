@@ -115,6 +115,112 @@ def normalize_website(value: object) -> str | None:
     return f"https://{domain}" if domain else None
 
 
+def normalize_page_url(value: object) -> str | None:
+    """Canonicalize a full page URL, **keeping the path**.
+
+    :func:`normalize_website` deliberately collapses a URL to its host, which is
+    right for a company's home page and wrong for a contact page — there the
+    path is the entire point. This keeps scheme, host and path, and drops the
+    query and fragment so tracking parameters cannot make two exports of the
+    same page differ. Anything that is not http(s) (``mailto:``, ``javascript:``,
+    ``tel:``) returns ``None``.
+    """
+    text = clean_text(value)
+    if text is None:
+        return None
+
+    if _SCHEME_RE.match(text):
+        scheme = text.split(":", 1)[0].casefold()
+        if scheme not in {"http", "https"}:
+            return None
+    text = _SCHEME_RE.sub("", text)
+    text = re.split(r"[?#]", text, maxsplit=1)[0]
+    if not text:
+        return None
+
+    host, _, path = text.partition("/")
+    domain = normalize_domain(host)
+    if domain is None:
+        return None
+    return f"https://{domain}/{path.strip('/')}" if path.strip("/") else f"https://{domain}"
+
+
+#: Social and profile platforms worth recording, mapped from the hostname that
+#: identifies them to the slug used in the exported record. Ordered longest
+#: host first so a more specific entry wins over a shorter suffix of it.
+SOCIAL_PLATFORMS: tuple[tuple[str, str], ...] = (
+    ("linkedin.com", "linkedin"),
+    ("twitter.com", "x"),
+    ("x.com", "x"),
+    ("facebook.com", "facebook"),
+    ("instagram.com", "instagram"),
+    ("github.com", "github"),
+    ("gitlab.com", "gitlab"),
+    ("youtube.com", "youtube"),
+    ("youtu.be", "youtube"),
+    ("crunchbase.com", "crunchbase"),
+    ("angel.co", "angellist"),
+    ("medium.com", "medium"),
+    ("glassdoor.com", "glassdoor"),
+    ("t.me", "telegram"),
+)
+
+
+def social_platform_for_url(value: object) -> tuple[str, str] | None:
+    """Classify a URL as a social/profile link.
+
+    Returns:
+        ``(platform_slug, canonical_url)``, or ``None`` when the URL is not one
+        of the recognised platforms. Shared pages (a post, a search result) are
+        rejected — only a profile a company actually owns is worth recording.
+    """
+    url = normalize_page_url(value)
+    if url is None:
+        return None
+
+    host = normalize_domain(url)
+    if host is None:
+        return None
+    # Match on label boundaries so ``notlinkedin.com`` is not read as LinkedIn.
+    labels = host.split(".")
+    for suffix, slug in SOCIAL_PLATFORMS:
+        parts = suffix.split(".")
+        if len(labels) >= len(parts) and labels[-len(parts) :] == parts:
+            path = url.split("/", 3)[3] if url.count("/") >= 3 else ""
+            if not path:
+                return None
+            if slug == "linkedin":
+                # One canonical LinkedIn form across the whole application: the
+                # dedicated company field and the social-links map must agree,
+                # or deduplication would treat one company as two.
+                return slug, normalize_linkedin_url(url) or url
+            return slug, url
+    return None
+
+
+def normalize_social_links(values: object) -> dict[str, str]:
+    """Build a ``platform -> url`` mapping from anything resembling one.
+
+    Accepts a mapping (as a crawler adapter supplies) or a list of URLs. Entries
+    that are not recognisable profile links are dropped rather than guessed at,
+    and the first URL wins for a platform so the result is deterministic.
+    """
+    candidates: list[object] = []
+    if isinstance(values, dict):
+        candidates.extend(values.values())
+    elif isinstance(values, (list, tuple, set)):
+        candidates.extend(values)
+
+    links: dict[str, str] = {}
+    for candidate in candidates:
+        classified = social_platform_for_url(candidate)
+        if classified is None:
+            continue
+        platform, url = classified
+        links.setdefault(platform, url)
+    return links
+
+
 def normalize_linkedin_url(value: object, *, kind: str = "any") -> str | None:
     """Canonicalize a LinkedIn profile or company URL.
 

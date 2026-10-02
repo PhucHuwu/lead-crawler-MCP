@@ -64,7 +64,8 @@ src/
 ├── crawlers/      one module per data source
 │   ├── base.py        BaseCrawler ABC + the adapter contract
 │   ├── registry.py    slug → class registry, build_crawler()
-│   ├── apollo.py      Apollo.io people search (paginated, retried)
+│   ├── apollo.py      Apollo.io people search via the official API
+│   ├── website.py     company-site enrichment: description, emails, socials
 │   ├── csv_source.py  local CSV/TSV with header aliasing and sniffing
 │   └── mock.py        deterministic synthetic leads for demos and CI
 ├── models/
@@ -85,10 +86,11 @@ src/
 ├── exporters/     CsvExporter / JsonExporter / JsonLinesExporter + run report
 ├── utils/         text, urls, numbers, http (retrying client), logging, io
 ├── config.py      pydantic-settings tree, environment-driven
+├── search_profiles.py  named, version-controlled search criteria (YAML)
 └── main.py        CLI: flags → settings → pipeline → exporters → exit code
 ```
 
-### The five design decisions that matter
+### The design decisions that matter
 
 **1. One interface, many sources.** Every adapter implements the same contract:
 
@@ -141,6 +143,20 @@ source is seeded for the same reason.
 place, so a crash or a full disk never leaves a half-written file that looks
 valid.
 
+**7. Source knowledge stays inside its adapter.** Where a source has an official
+API, the adapter calls the API rather than scraping the site behind it — Apollo
+is read through `api.apollo.io` with a key, never through its web UI. Everything
+provider-specific (Apollo's field names, its seniority vocabulary, the JSON-LD
+and `<meta>` shapes of a company homepage) lives in that one module and is
+translated to the shared `RawLead` at the boundary. Nothing downstream can tell
+which source a lead came from except by reading `lead.source.provider`.
+
+That cuts both ways: `config/search_profiles.yaml` stores seniorities as plain
+strings rather than the internal `SeniorityLevel` enum, because that enum maps
+`head` onto `DIRECTOR` — routing a profile through it would quietly search for
+the wrong people. The Apollo adapter validates the strings against Apollo's own
+vocabulary instead, and the rest of the application never sees them.
+
 ---
 
 ## CLI usage
@@ -176,6 +192,25 @@ python -m src.main -s apollo --limit 500 --require-email --verbose
 
 # Machine-readable logs for a pipeline.
 python -m src.main -s apollo --log-format json --log-level DEBUG
+
+# Apollo search criteria live in the environment …
+LEAD_APOLLO__PERSON_TITLES="CTO,VP Engineering,Head of Engineering" \
+LEAD_APOLLO__PERSON_SENIORITIES=c_suite,vp,head \
+LEAD_APOLLO__ORGANIZATION_LOCATIONS=Singapore,Japan,Australia \
+  python -m src.main -s apollo --limit 300
+
+# … or in a profile file, which is the same thing but version-controlled.
+python -m src.main -s apollo --search-profile default --limit 300
+python -m src.main -s apollo --search-profile sea_fintech --limit 300
+python -m src.main -s apollo --search-profile --search-profiles-path ./team.yaml
+
+# Enrich companies from their own public websites — one record per site.
+python -m src.main -s website --website-url acme.com --website-url beta.example
+python -m src.main -s website --website-url acme.com,beta.example --format jsonl
+
+# Apollo's people plus their employers' public pages, merged and de-duplicated.
+python -m src.main -s apollo,website --search-profile default \
+  --website-url acme.com --limit 200
 ```
 
 ### Where the output goes
@@ -279,10 +314,24 @@ Every rule is opt-in; with defaults the pipeline keeps everything that validates
 | `LEAD_APOLLO__API_KEY` | *(none)* | **Required** for `--source apollo` |
 | `LEAD_APOLLO__BASE_URL` | `https://api.apollo.io/api/v1` | Override for a proxy |
 | `LEAD_APOLLO__PER_PAGE` | `25` | Results per request (max 100) |
+| `LEAD_APOLLO__MAX_PAGES` | `20` | Pagination safety valve (1–500) |
 | `LEAD_APOLLO__PERSON_TITLES` | *(empty)* | Search filter, e.g. `CTO,VP Engineering` |
+| `LEAD_APOLLO__PERSON_SENIORITIES` | *(empty)* | Apollo's vocabulary — see below |
 | `LEAD_APOLLO__PERSON_LOCATIONS` | *(empty)* | e.g. `Vietnam,Singapore` |
 | `LEAD_APOLLO__ORGANIZATION_LOCATIONS` | *(empty)* | HQ locations |
+| `LEAD_APOLLO__ORGANIZATION_INDUSTRIES` | *(empty)* | Apollo industry tags |
+| `LEAD_APOLLO__EMPLOYEE_COUNT_RANGES` | *(empty)* | Headcount bands, e.g. `11-50,201-500` |
+| `LEAD_APOLLO__INCLUDE_SIMILAR_TITLES` | `true` | Let Apollo widen title matches |
 | `LEAD_APOLLO__Q_KEYWORDS` | *(none)* | Free-text keyword search |
+| `LEAD_SEARCH_PROFILES_PATH` | `config/search_profiles.yaml` | Profile file |
+| `LEAD_SEARCH_PROFILE` | *(none)* | Profile to apply when none is named |
+| `LEAD_WEBSITE__URLS` | *(empty)* | **Required** for `--source website` |
+| `LEAD_WEBSITE__MAX_PAGES_PER_SITE` | `3` | Homepage included (1–10) |
+| `LEAD_WEBSITE__REQUEST_DELAY` | `1.0` | Seconds between hits on one host |
+| `LEAD_WEBSITE__RESPECT_ROBOTS` | `true` | Off only for a site you own |
+| `LEAD_WEBSITE__SAME_HOST_ONLY` | `true` | Never follow off-site links |
+| `LEAD_WEBSITE__MAX_EMAILS` | `3` | Addresses kept per site |
+| `LEAD_WEBSITE__USER_AGENT` | identifying UA | Sent with every request |
 | `LEAD_CSV_SOURCE__PATH` | *(none)* | **Required** for `--source csv` |
 | `LEAD_CSV_SOURCE__DELIMITER` | `,` | Or `auto` to sniff |
 | `LEAD_CSV_SOURCE__ENCODING` | `utf-8-sig` | Raise a clear error on mismatch |
@@ -290,6 +339,79 @@ Every rule is opt-in; with defaults the pipeline keeps everything that validates
 | `LEAD_MOCK__SEED` | `1337` | Fix for reproducible output |
 | `LEAD_MOCK__MESSY_RATIO` | `0.25` | Fraction deliberately left dirty |
 | `LEAD_MOCK__DUPLICATE_RATIO` | `0.15` | Fraction given duplicate identities |
+
+`LEAD_APOLLO__PERSON_SENIORITIES` uses Apollo's own vocabulary, not the internal
+`SeniorityLevel` enum: `owner`, `founder`, `c_suite`, `partner`, `vp`, `head`,
+`director`, `manager`, `senior`, `entry`, `intern`. Case, spaces and hyphens are
+forgiven (`"C-Suite"` → `c_suite`), a value that is not in that list is a
+configuration error naming the offending value, and duplicates collapse.
+
+`LEAD_APOLLO__EMPLOYEE_COUNT_RANGES` bands are written with a hyphen
+(`11-50,201-500`), because a comma inside a comma-separated value would be read
+as the next band. A JSON array may still use the real Apollo spelling,
+`["201,500"]`.
+
+### Named search profiles
+
+Search criteria are a campaign's data, not a shell incantation, so they can live
+in a YAML file next to the code. `config/search_profiles.yaml` ships three
+profiles — `default`, `sea_fintech` and `enterprise_apac`:
+
+```yaml
+default:
+  titles: [CTO, VP Engineering, Head of Engineering, Founder]
+  seniorities: [c_suite, vp, head, founder]
+  locations: [Singapore, Japan, Australia]
+
+sea_fintech:
+  titles: [Chief Technology Officer, Head of Platform, VP of Engineering]
+  seniorities: [c_suite, vp, head]
+  locations: [Singapore, Indonesia, Vietnam, Malaysia, Thailand]
+  industries: [financial services, banking]
+  employee_ranges: ["11,50", "51,200", "201,500"]
+  keywords: [payments]
+  similar_titles: true
+```
+
+Every key is optional and maps onto one Apollo search parameter:
+`titles` → `person_titles`, `seniorities` → `person_seniorities`,
+`locations` → `organization_locations`, `person_locations` → `person_locations`,
+`industries` → `organization_industries`, `employee_ranges` →
+`organization_num_employees_ranges`, `keywords` → `q_keywords`, and
+`similar_titles` → `include_similar_titles`.
+
+Selection order, weakest to strongest:
+
+1. `LEAD_APOLLO__*` — the environment defaults
+2. the named profile — overrides only the fields it sets
+3. CLI flags (`--limit`, `--search-profile`, `--search-profiles-path`)
+
+A field the profile omits keeps its environment value, so a profile can be a
+narrow delta rather than a full restatement. `--search-profile` with no value
+means `default`. An unknown profile name, an unknown field, or an unparseable
+band is a configuration error (exit 2) raised *before* any request is made — a
+typo costs you a message, not a quota.
+
+### The website source
+
+`website` is an enrichment adapter, not a directory: you give it company domains
+and it reads their public pages for a description, contact page, published email
+addresses and social links. One record per site.
+
+It is deliberately polite. It reads the homepage and at most one contact-style
+page per site (`MAX_PAGES_PER_SITE`, hard-capped at 10), waits
+`REQUEST_DELAY` seconds between requests to the same host, identifies itself in
+the `User-Agent`, and obeys `robots.txt` — failing *open* when a site has none,
+which is the common case, and skipping a path it is asked not to fetch. Links to
+other hosts are not followed unless `SAME_HOST_ONLY` is turned off. A site whose
+pages contain nothing beyond a domain produces no record at all rather than an
+empty one.
+
+All of the HTML and JSON-LD understanding is private to `src/crawlers/website.py`;
+it uses the standard library parser and adds no scraping dependency. The
+company's first published mailbox is placed in the person email field — the
+schema's only address slot — and every address found is preserved verbatim in
+the record's `raw` payload.
 
 ---
 
@@ -327,7 +449,7 @@ filters and deduplicator apply unchanged.
 ## Tests
 
 ```bash
-pytest                      # 451 tests
+pytest                      # 547 tests
 pytest tests/test_cli.py -v # one module
 pytest -k dedup             # by name
 
@@ -352,11 +474,26 @@ stage accounting, and the CLI exit-code contract.
 Phase 1 is deliberately narrow. What it does **not** do:
 
 - **No Apollo writes, no enrichment.** Only the people-search read path is
-  implemented; the key must have access to it.
-- **No pagination beyond 20 pages** per source per run (`MAX_PAGES` in
-  `src/crawlers/apollo.py`). At the default `per_page=25` that is 500 records; up
-  to 2,000 with `LEAD_APOLLO__PER_PAGE=100`. A larger pull needs either a
-  narrower search or a later phase with query partitioning.
+  implemented; the key must have access to it. Apollo's people search does not
+  return email addresses, so `--source apollo` on its own will be emptied by
+  `--require-email` — pair it with `website` or a CSV export that carries
+  contacts.
+- **Apollo pagination is bounded** by `LEAD_APOLLO__MAX_PAGES` (default 20). At
+  the default `per_page=25` that is 500 records; up to 2,000 with
+  `LEAD_APOLLO__PER_PAGE=100`. A larger pull needs either a narrower search or a
+  later phase with query partitioning.
+- **The `website` source is enrichment, not discovery.** It only ever reads the
+  domains you hand it; it does not find companies for you. It also reports one
+  record per site, not per person — it can describe an employer but cannot tell
+  you who works there. Emails found on a site are frequently shared inboxes
+  (`info@`), which `--exclude-role-based-email` will then drop.
+- **Website extraction is heuristic.** Open Graph tags, JSON-LD `Organization`
+  blocks and `<title>` taglines cover the common shapes; a site that renders
+  everything client-side, or that publishes none of them, yields little. Nothing
+  is executed — only the HTML that is served is read, and no JavaScript is run.
+- **A website seed is normalized to `https://<host>`**, dropping any scheme and
+  port you typed. That is right for a public company site and wrong for a
+  staging box on `http://localhost:8080`, which this source cannot reach.
 - **`aggressive` dedup can over-merge.** It matches on name + company domain,
   which collapses two genuinely different people who share a name at one
   employer. `identity` (the default) is the conservative choice.
@@ -378,14 +515,17 @@ Phase 1 is deliberately narrow. What it does **not** do:
 
 Natural follow-ons, roughly in dependency order:
 
-1. **More sources** — LinkedIn Sales Navigator exports, Crunchbase, Hunter,
-   Clearbit, or a generic "any JSON API" adapter. Each is one module.
+1. **More sources** — Crunchbase, Hunter, Clearbit, or a generic "any JSON API"
+   adapter. Each is one module. The `website` adapter is also the natural place
+   to add per-site extraction rules when a high-value domain needs them.
 2. **A persistence layer** — write runs into SQLite/Postgres keyed by the
    deterministic `lead_id`, so runs can be diffed (new / changed / gone) instead
    of overwritten.
 3. **XLSX export** — the CSV exporter already centralizes the column list; an
    openpyxl writer is a small addition.
 4. **A second-pass enrichment stage** — a processor that takes an already
-   standardized lead set and fills gaps from a second provider.
+   standardized lead set and fills gaps from a second provider. The `website`
+   adapter already has the right shape for this: pointing it at the domains a
+   first pass discovered, rather than at domains typed on a command line.
 5. **Scheduling** — only once the run and its outputs are persisted, so a
    scheduled run has somewhere to record what it did.

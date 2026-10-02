@@ -1,0 +1,104 @@
+# Search profiles for the `apollo` source.
+#
+# A profile is a named, reusable search definition: instead of typing the same
+# six flags on every run, select a profile with `--search-profile <name>`.
+#
+#     python -m src.main --source apollo --search-profile default --limit 100
+#     python -m src.main --source apollo --search-profile      # short for `default`
+#
+# Resolution order, weakest first:
+#
+#     LEAD_APOLLO__* environment values  <  search profile  <  CLI flags
+#
+# So a profile overrides the generic environment defaults, and an explicit flag
+# on the command line beats both. Point at a different file with
+# LEAD_SEARCH_PROFILES_PATH; with no --search-profile and no LEAD_SEARCH_PROFILE
+# nothing here is loaded and Apollo uses the LEAD_APOLLO__* values alone.
+#
+# Every key is optional. Omit one and it is left out of the query entirely
+# (Apollo treats an empty list differently from an absent key, so an empty or
+# missing filter is never sent as `[]`).
+#
+# Keys
+#   titles          person_titles — job titles to match. Partial matches count.
+#   seniorities     person_seniorities — Apollo's vocabulary: owner, founder,
+#                   c_suite, partner, vp, head, director, manager, senior,
+#                   entry, intern. NOT this project's normalized levels: Apollo
+#                   distinguishes `head` from `director`, so they are passed
+#                   through verbatim to preserve that distinction.
+#   locations       organization_locations — where the COMPANY is based.
+#   person_locations  where the PERSON is based (usually less useful than the
+#                   company's, which is why it is not in the examples below).
+#   industries      organization_industries — Apollo industry tags.
+#   employee_ranges organization_num_employees_ranges — "min,max" pairs. The
+#                   band matters, not a point value: "201,500" is the 201-500
+#                   band. Ranges may not overlap.
+#   keywords        q_keywords — free-text terms ANDed into the search.
+#   similar_titles  include_similar_titles — let Apollo widen each title to
+#                   near-equivalents. Defaults to true when unset.
+
+default:
+  titles:
+    - CTO
+    - VP Engineering
+    - Head of Engineering
+    - Founder
+  seniorities:
+    - c_suite
+    - vp
+    - head
+    - founder
+  locations:
+    - Singapore
+    - Japan
+    - Australia
+
+# A second profile, to show the fuller shape. Select with
+# `--search-profile sea_fintech`.
+sea_fintech:
+  titles:
+    - Chief Technology Officer
+    - Head of Platform
+    - VP of Engineering
+    - Head of Infrastructure
+  seniorities:
+    - c_suite
+    - vp
+    - head
+  locations:
+    - Singapore
+    - Indonesia
+    - Vietnam
+    - Malaysia
+    - Thailand
+  industries:
+    - financial services
+    - banking
+    - information technology & services
+  employee_ranges:
+    - "11,50"
+    - "51,200"
+    - "201,500"
+  keywords:
+    - payments
+  similar_titles: true
+
+# Large-enterprise variant of the same targeting.
+enterprise_apac:
+  titles:
+    - CTO
+    - CIO
+    - Chief Information Officer
+    - VP Engineering
+  seniorities:
+    - c_suite
+    - vp
+  locations:
+    - Singapore
+    - Japan
+    - Australia
+    - Hong Kong
+  employee_ranges:
+    - "1001,5000"
+    - "5001,10000"
+  similar_titles: false

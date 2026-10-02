@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -24,6 +25,7 @@ from src.config import Settings, load_settings
 from src.crawlers.apollo import ApolloCrawler
 from src.models.lead import RawLead
 from src.utils.errors import (
+    ConfigError,
     CrawlerError,
     SourceAuthError,
     SourceRateLimitError,
@@ -513,3 +515,170 @@ def test_raw_payload_is_retained_for_debugging() -> None:
     person = {"id": "1", "unknown_field": "kept"}
     lead: RawLead = crawler._map_person(person)
     assert lead.raw == person
+
+
+class TestExtendedFilters:
+    """The search filters added on top of titles and keywords.
+
+    Apollo distinguishes an absent key from an empty list, so every one of these
+    is asserted both ways: forwarded when configured, omitted when not.
+    """
+
+    @respx.mock
+    async def test_seniorities_industries_and_sizes_are_forwarded(
+        self, make_crawler: Callable[..., ApolloCrawler]
+    ) -> None:
+        route = respx.post(f"{BASE_URL}{SEARCH_PATH}").mock(
+            return_value=httpx.Response(200, json={"people": []})
+        )
+        crawler = make_crawler(
+            person_seniorities=["c_suite", "vp"],
+            organization_industries=["software", "fintech"],
+            employee_count_ranges=["201-500", "501-1000"],
+            person_locations=["Singapore"],
+            organization_locations=["Japan"],
+        )
+        await crawler.crawl(5)
+        body = json.loads(route.calls[0].request.content)
+        assert body["person_seniorities"] == ["c_suite", "vp"]
+        assert body["organization_industries"] == ["software", "fintech"]
+        # Normalized to the "min,max" form Apollo expects, whatever was typed.
+        assert body["organization_num_employees_ranges"] == ["201,500", "501,1000"]
+        assert body["person_locations"] == ["Singapore"]
+        assert body["organization_locations"] == ["Japan"]
+
+    @respx.mock
+    async def test_the_new_filters_are_omitted_when_unset(
+        self, make_crawler: Callable[..., ApolloCrawler]
+    ) -> None:
+        route = respx.post(f"{BASE_URL}{SEARCH_PATH}").mock(
+            return_value=httpx.Response(200, json={"people": []})
+        )
+        await make_crawler().crawl(5)
+        body = json.loads(route.calls[0].request.content)
+        for key in (
+            "person_seniorities",
+            "organization_industries",
+            "organization_num_employees_ranges",
+            "person_locations",
+            "organization_locations",
+            "include_similar_titles",
+        ):
+            assert key not in body
+
+    @respx.mock
+    async def test_similar_titles_accompanies_a_title_search(
+        self, make_crawler: Callable[..., ApolloCrawler]
+    ) -> None:
+        route = respx.post(f"{BASE_URL}{SEARCH_PATH}").mock(
+            return_value=httpx.Response(200, json={"people": []})
+        )
+        await make_crawler(person_titles=["CTO"], include_similar_titles=False).crawl(5)
+        # False is a real choice and must survive as an explicit false, not be
+        # dropped the way an unset filter is.
+        assert json.loads(route.calls[0].request.content)["include_similar_titles"] is False
+
+    @respx.mock
+    async def test_max_pages_bounds_the_pagination(
+        self, make_crawler: Callable[..., ApolloCrawler]
+    ) -> None:
+        route = respx.post(f"{BASE_URL}{SEARCH_PATH}").mock(
+            return_value=httpx.Response(
+                200, json={"people": [{"id": str(index)} for index in range(5)]}
+            )
+        )
+        await make_crawler(per_page=5, max_pages=2).crawl(50)
+        assert route.call_count == 2
+
+    def test_an_unknown_seniority_is_rejected_before_any_request(self) -> None:
+        # Validation happens at construction, so a bad profile name or value
+        # fails the run before a single request is spent. The message has to
+        # name both the offending value and the allowed set: this is normally
+        # hit from a YAML file, not from code with a schema handy.
+        with pytest.raises(ConfigError) as excinfo:
+            ApolloCrawler(apollo_settings(person_seniorities=["chief"]))
+        assert "chief" in str(excinfo.value)
+        assert "c_suite" in str(excinfo.value)
+
+    def test_seniority_spellings_are_forgiving_about_shape(self) -> None:
+        crawler = ApolloCrawler(apollo_settings(person_seniorities=["C-Suite", "VP"]))
+        assert crawler.search.seniorities == ("c_suite", "vp")
+
+    def test_duplicate_seniorities_collapse(self) -> None:
+        crawler = ApolloCrawler(apollo_settings(person_seniorities=["vp", "VP"]))
+        assert crawler.search.seniorities == ("vp",)
+
+
+class TestSearchProfiles:
+    """A profile replaces the configured search; the CLI flag selects it."""
+
+    @staticmethod
+    def profile_settings(tmp_path: Path, body: str, **overrides: Any) -> Settings:
+        path = tmp_path / "profiles.yaml"
+        path.write_text(body, encoding="utf-8")
+        return load_settings(
+            apollo={"api_key": "test-key", **overrides},
+            search_profile="default",
+            search_profiles_path=path,
+            http_initial_backoff=0.001,
+            http_max_backoff=0.002,
+        )
+
+    def test_a_profile_overrides_the_settings(self, tmp_path: Path) -> None:
+        settings = self.profile_settings(
+            tmp_path,
+            "default:\n"
+            "  titles: [CTO, Founder]\n"
+            "  seniorities: [c_suite, founder]\n"
+            "  locations: [Singapore]\n"
+            "  industries: [software]\n"
+            "  employee_ranges: ['11-50']\n"
+            "  keywords: payments\n",
+            person_titles=["Ignored"],
+            q_keywords="ignored",
+        )
+        search = ApolloCrawler(settings).search
+        assert search.titles == ("CTO", "Founder")
+        assert search.seniorities == ("c_suite", "founder")
+        assert search.organization_locations == ("Singapore",)
+        assert search.industries == ("software",)
+        assert search.employee_ranges == ("11,50",)
+        assert search.keywords == "payments"
+
+    def test_fields_the_profile_omits_keep_their_settings(self, tmp_path: Path) -> None:
+        settings = self.profile_settings(
+            tmp_path,
+            "default:\n  titles: [CTO]\n",
+            person_locations=["Japan"],
+            q_keywords="fintech",
+        )
+        search = ApolloCrawler(settings).search
+        assert search.titles == ("CTO",)
+        assert search.person_locations == ("Japan",)
+        assert search.keywords == "fintech"
+
+    def test_no_profile_leaves_the_settings_alone(self) -> None:
+        crawler = ApolloCrawler(apollo_settings(person_titles=["CTO"], q_keywords="fintech"))
+        assert crawler.search.titles == ("CTO",)
+        assert crawler.search.keywords == "fintech"
+
+    def test_an_unknown_profile_name_fails_configuration(self, tmp_path: Path) -> None:
+        settings = self.profile_settings(tmp_path, "default:\n  titles: [CTO]\n")
+        settings.search_profile = "nope"
+        with pytest.raises(ConfigError, match="unknown search profile"):
+            ApolloCrawler(settings)
+
+    @respx.mock
+    async def test_a_profile_drives_the_request(self, tmp_path: Path) -> None:
+        route = respx.post(f"{BASE_URL}{SEARCH_PATH}").mock(
+            return_value=httpx.Response(200, json={"people": []})
+        )
+        settings = self.profile_settings(
+            tmp_path, "default:\n  titles: [CTO]\n  seniorities: [c_suite]\n"
+        )
+        crawler = ApolloCrawler(settings)
+        await crawler.crawl(5)
+        await crawler.aclose()
+        body = json.loads(route.calls[0].request.content)
+        assert body["person_titles"] == ["CTO"]
+        assert body["person_seniorities"] == ["c_suite"]

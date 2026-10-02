@@ -48,6 +48,19 @@ def slugify_identity(value: str | None) -> str:
     return _SLUG_RE.sub("", value.casefold())
 
 
+def format_social_links(links: dict[str, str]) -> str | None:
+    """Render social links as ``github=https://…; linkedin=https://…``.
+
+    A flat string because the destination is a spreadsheet column: JSON would
+    be more faithful but unreadable in Excel, and the set of platforms is open
+    so there is no fixed number of columns to give them. Sorted by platform so
+    two exports of the same lead are byte-identical.
+    """
+    if not links:
+        return None
+    return "; ".join(f"{platform}={url}" for platform, url in sorted(links.items()))
+
+
 class LeadSource(BaseModel):
     """Provenance for a lead — where it came from and when we saw it.
 
@@ -98,6 +111,11 @@ class RawLead(BaseModel):
     company_country: str | None = None
     company_city: str | None = None
     company_linkedin_url: str | None = None
+    #: Enrichment-only fields, supplied by sources that read company sites.
+    company_description: str | None = None
+    company_contact_url: str | None = None
+    #: Platform slug -> URL, e.g. ``{"linkedin": "https://...", "github": ...}``.
+    company_social_links: dict[str, str] = Field(default_factory=dict)
 
     #: Untouched upstream record, preserved for debugging and re-processing.
     raw: dict[str, Any] = Field(default_factory=dict)
@@ -208,6 +226,9 @@ class StandardizedLead(BaseModel):
             "company_country": self.company.country,
             "company_city": self.company.city,
             "company_linkedin_url": self.company.linkedin_url,
+            "company_description": self.company.description,
+            "company_contact_url": self.company.contact_url,
+            "company_social_links": format_social_links(self.company.social_links),
             "source_provider": self.source.provider,
             "source_external_id": self.source.external_id,
             "source_url": self.source.source_url,

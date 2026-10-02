@@ -33,6 +33,8 @@ from src.utils.urls import (
     is_free_email_domain,
     normalize_domain,
     normalize_linkedin_url,
+    normalize_page_url,
+    normalize_social_links,
     normalize_website,
 )
 
@@ -41,6 +43,11 @@ logger = get_logger(__name__)
 #: Headcounts above this are data-entry errors (population-scale "companies"),
 #: not real employers. Dropped rather than allowed to distort size filters.
 MAX_PLAUSIBLE_EMPLOYEES = 2_000_000
+
+#: Ceiling on a company description. Meta descriptions and JSON-LD are usually
+#: one or two sentences; anything far longer is boilerplate that would bloat
+#: every export row without adding a usable signal.
+MAX_DESCRIPTION_CHARS = 600
 
 
 class Normalizer:
@@ -129,6 +136,12 @@ class Normalizer:
             )
             employee_count = None
 
+        social_links = normalize_social_links(raw.company_social_links)
+        linkedin_url = normalize_linkedin_url(raw.company_linkedin_url, kind="company")
+        if linkedin_url is None:
+            # A profile page is the same fact however the source labelled it.
+            linkedin_url = social_links.get("linkedin")
+
         return Company(
             name=titlecase_name(raw.company_name),
             domain=domain,
@@ -137,8 +150,22 @@ class Normalizer:
             employee_count=employee_count,
             country=normalize_country(raw.company_country),
             city=titlecase_name(raw.company_city),
-            linkedin_url=normalize_linkedin_url(raw.company_linkedin_url, kind="company"),
+            linkedin_url=linkedin_url,
+            description=_truncate_description(raw.company_description),
+            contact_url=normalize_page_url(raw.company_contact_url),
+            social_links=social_links,
         )
+
+
+def _truncate_description(value: object) -> str | None:
+    """Clean a company description and cap its length."""
+    text = clean_text(value)
+    if text is None:
+        return None
+    if len(text) <= MAX_DESCRIPTION_CHARS:
+        return text
+    # Cut on a word boundary so the truncation does not read as a typo.
+    return text[:MAX_DESCRIPTION_CHARS].rsplit(" ", 1)[0].rstrip(",;:") + "…"
 
 
 __all__ = ["MAX_PLAUSIBLE_EMPLOYEES", "Normalizer"]

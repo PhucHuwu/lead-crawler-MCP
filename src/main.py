@@ -131,6 +131,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Input file for the 'csv' source.",
     )
     sources.add_argument(
+        "--website-url",
+        action="append",
+        metavar="URL",
+        help=(
+            "Company site for the 'website' source, e.g. acme.com. "
+            "Repeat or comma-separate for several."
+        ),
+    )
+    sources.add_argument(
+        "--search-profile",
+        nargs="?",
+        const="default",
+        metavar="NAME",
+        help=(
+            "Named filter set from the search profiles file for the 'apollo' source. "
+            "Bare --search-profile means the 'default' profile."
+        ),
+    )
+    sources.add_argument(
+        "--search-profiles-path",
+        type=Path,
+        metavar="PATH",
+        help="Search profiles file (default: LEAD_SEARCH_PROFILES_PATH).",
+    )
+    sources.add_argument(
         "--list-sources", action="store_true", help="List available sources and exit."
     )
 
@@ -291,6 +316,8 @@ def build_settings(args: argparse.Namespace) -> Settings:
         "dedup_strategy": args.dedup,
         "min_completeness": args.min_completeness,
         "sort_by_completeness": args.sort_by_completeness,
+        "search_profile": args.search_profile,
+        "search_profiles_path": args.search_profiles_path,
     }
 
     formats = _split_csv_arg(args.format)
@@ -302,6 +329,9 @@ def build_settings(args: argparse.Namespace) -> Settings:
 
     if args.csv_path is not None:
         overrides["csv_source"] = {"path": args.csv_path}
+
+    if website_urls := _split_csv_arg(args.website_url):
+        overrides["website"] = {"urls": website_urls}
 
     return load_settings(
         env_file=args.config,
@@ -420,6 +450,8 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
             "min_completeness": settings.min_completeness,
             "sort_by_completeness": settings.sort_by_completeness,
             "filters_active": settings.filters.is_active,
+            "search_profile": settings.search_profile,
+            "website_urls": len(settings.website.urls),
             "max_concurrency": settings.max_concurrency,
             "http_max_attempts": settings.http_max_attempts,
             "write_run_report": settings.write_run_report,

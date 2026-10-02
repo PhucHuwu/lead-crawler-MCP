@@ -8,7 +8,13 @@ import pytest
 
 from src.exporters.csv_exporter import LEAD_COLUMNS
 from src.models.enums import DedupStrategy, SeniorityLevel
-from src.models.lead import LeadSource, RawLead, StandardizedLead, slugify_identity
+from src.models.lead import (
+    LeadSource,
+    RawLead,
+    StandardizedLead,
+    format_social_links,
+    slugify_identity,
+)
 from src.models.results import CrawlStats
 from tests.conftest import make_lead, make_raw_lead
 
@@ -108,6 +114,44 @@ class TestFlatten:
 
     def test_enum_rendered_as_value(self) -> None:
         assert make_lead().flatten()["seniority"] == SeniorityLevel.UNKNOWN.value
+
+
+class TestEnrichmentColumns:
+    """The three columns the website source populates.
+
+    A spreadsheet column cannot hold a mapping, so social links are rendered as
+    one string — and that rendering has to be deterministic, or two exports of
+    the same lead would differ in a diff.
+    """
+
+    def test_social_links_render_as_sorted_pairs(self) -> None:
+        rendered = format_social_links(
+            {"linkedin": "https://www.linkedin.com/company/acme", "github": "https://github.com/a"}
+        )
+        assert (
+            rendered
+            == "github=https://github.com/a; linkedin=https://www.linkedin.com/company/acme"
+        )
+
+    def test_no_links_render_as_none(self) -> None:
+        # Empty dict and missing map must be indistinguishable in the export.
+        assert format_social_links({}) is None
+
+    def test_the_enrichment_fields_reach_the_row(self) -> None:
+        lead = make_lead()
+        lead.company.description = "Acme builds widgets."
+        lead.company.contact_url = "https://acme.com/contact"
+        lead.company.social_links = {"github": "https://github.com/acme"}
+        row = lead.flatten()
+        assert row["company_description"] == "Acme builds widgets."
+        assert row["company_contact_url"] == "https://acme.com/contact"
+        assert row["company_social_links"] == "github=https://github.com/acme"
+
+    def test_enrichment_fields_default_to_blank(self) -> None:
+        row = make_lead().flatten()
+        assert row["company_description"] is None
+        assert row["company_contact_url"] is None
+        assert row["company_social_links"] is None
 
 
 class TestRawLead:

@@ -22,11 +22,19 @@ import json
 from pathlib import Path
 from typing import Annotated, Any
 
-from pydantic import BaseModel, BeforeValidator, Field, SecretStr, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from src.models.enums import DedupStrategy, ExportFormat, LogFormat, SeniorityLevel
 from src.utils.errors import ConfigError
+from src.utils.numbers import parse_employee_range
 
 
 def _split_list(value: Any) -> Any:
@@ -149,7 +157,12 @@ class FilterSettings(BaseModel):
 
 
 class ApolloSettings(BaseModel):
-    """Credentials and tuning for the Apollo.io source."""
+    """Credentials and tuning for the Apollo.io source.
+
+    The search fields here are the *defaults* for a run. A named search profile
+    (see :mod:`src.search_profiles`) overrides them, and an explicit CLI flag
+    overrides both — see ``ApolloCrawler.resolve_search``.
+    """
 
     model_config = {"extra": "forbid"}
 
@@ -157,15 +170,89 @@ class ApolloSettings(BaseModel):
     base_url: str = "https://api.apollo.io/api/v1"
     #: Apollo caps ``per_page`` at 100; 25 keeps responses small and cheap.
     per_page: int = Field(default=25, ge=1, le=100)
+    #: Safety valve on pagination: a mis-set ``--limit`` cannot spin forever.
+    max_pages: int = Field(default=20, ge=1, le=500)
     #: Free-text search terms forwarded to the people search endpoint.
     person_titles: CommaSeparated = Field(default_factory=list)
+    #: Apollo's own seniority vocabulary (``owner``, ``founder``, ``c_suite``,
+    #: ``partner``, ``vp``, ``head``, ``director``, ``manager``, ``senior``,
+    #: ``entry``, ``intern``). Deliberately plain strings rather than this
+    #: project's :class:`~src.models.enums.SeniorityLevel`: Apollo separates
+    #: ``head`` from ``director`` and collapsing them would quietly change the
+    #: search. Validated inside the adapter, which owns that vocabulary.
+    person_seniorities: CommaSeparated = Field(default_factory=list)
+    #: Where the person is based.
     person_locations: CommaSeparated = Field(default_factory=list)
+    #: Where the company is headquartered.
     organization_locations: CommaSeparated = Field(default_factory=list)
+    organization_industries: CommaSeparated = Field(default_factory=list)
+    #: Headcount bands as ``min,max`` pairs, e.g. ``"201,500"``.
+    employee_count_ranges: CommaSeparated = Field(default_factory=list)
+    #: Let Apollo widen each title to near-equivalents rather than exact matches.
+    include_similar_titles: bool = True
     q_keywords: str | None = None
+
+    @field_validator("employee_count_ranges")
+    @classmethod
+    def _validate_employee_ranges(cls, value: list[str]) -> list[str]:
+        """Normalize ``min,max`` bands.
+
+        Write them with a hyphen (``201-500``): a comma inside a
+        comma-separated environment value would be read as the next list item.
+        The comma form only survives inside a JSON array, where each element's
+        commas are unambiguous.
+        """
+        bands: list[str] = []
+        for entry in value:
+            parsed = parse_employee_range(entry)
+            if parsed is None:
+                raise ValueError(
+                    f'employee range {entry!r} must look like "201-500" '
+                    f"(use a hyphen, not a comma, in a comma-separated list)"
+                )
+            low, high = parsed
+            if low < 0:
+                raise ValueError(f"employee range {entry!r} must not be negative")
+            bands.append(f"{low},{high}")
+        return bands
 
     @property
     def is_configured(self) -> bool:
         return self.api_key is not None and bool(self.api_key.get_secret_value().strip())
+
+
+class WebsiteSettings(BaseModel):
+    """Tuning for the ``website`` enrichment source.
+
+    The defaults are deliberately conservative: this source reads public pages
+    that belong to someone else, so it identifies itself, obeys ``robots.txt``,
+    waits between requests and reads as few pages per site as it can get away
+    with.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    #: Company sites to enrich. Accepts bare domains (``acme.com``) as well as
+    #: full URLs; each entry produces at most one lead.
+    urls: CommaSeparated = Field(default_factory=list)
+    #: Pages to fetch per site, homepage included. Three covers the common
+    #: homepage + about + contact shape without turning into a site crawl.
+    max_pages_per_site: int = Field(default=3, ge=1, le=10)
+    #: Minimum seconds between two requests to the same host.
+    request_delay: float = Field(default=1.0, ge=0.0, le=60.0)
+    #: Honour ``robots.txt``. Off only for a site you own.
+    respect_robots: bool = True
+    #: Sent verbatim as ``User-Agent``. It should say who is calling and how to
+    #: ask them to stop; an anonymous crawler is a rude one.
+    user_agent: str = (
+        "TinasoftLeadCrawler/0.1 (+https://tinasoft.example/lead-crawler; "
+        "contact: data@tinasoft.example)"
+    )
+    #: Follow only links on the seed host. Off would turn this into a general
+    #: web crawler, which is exactly what it is not.
+    same_host_only: bool = True
+    #: Stop collecting public email addresses after this many per site.
+    max_emails: int = Field(default=3, ge=0, le=20)
 
 
 class CsvSourceSettings(BaseModel):
@@ -221,6 +308,11 @@ class Settings(BaseSettings):
     #: Provider slugs to crawl when ``--source`` is not given.
     default_sources: CommaSeparated = Field(default_factory=lambda: ["mock"])
     default_limit: int = Field(default=100, ge=1)
+    #: Named search profile to apply (see :mod:`src.search_profiles`). ``None``
+    #: loads no file at all, so this feature is inert until asked for.
+    search_profile: str | None = None
+    #: Where search profiles are read from.
+    search_profiles_path: Path = Path("config/search_profiles.yaml")
 
     # --- Output ----------------------------------------------------------- #
     output_dir: Path = Path("data/exports")
@@ -257,6 +349,7 @@ class Settings(BaseSettings):
     apollo: ApolloSettings = Field(default_factory=ApolloSettings)
     csv_source: CsvSourceSettings = Field(default_factory=CsvSourceSettings)
     mock: MockSettings = Field(default_factory=MockSettings)
+    website: WebsiteSettings = Field(default_factory=WebsiteSettings)
 
     # ------------------------------------------------------------------ #
     # Helpers

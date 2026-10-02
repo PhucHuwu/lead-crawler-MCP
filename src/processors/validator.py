@@ -14,7 +14,10 @@ import re
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.models.lead import StandardizedLead
+from src.utils.logging import get_logger
 from src.utils.urls import email_domain, is_free_email_domain
+
+logger = get_logger(__name__)
 
 #: Deliberately permissive: the normalizer already rejected anything obviously
 #: malformed, so this only catches values that slipped through.
@@ -86,13 +89,23 @@ class LeadValidator:
         issues: list[ValidationIssue] = []
         person, company = lead.person, lead.company
 
-        # --- There must be a person we can act on. ------------------------- #
-        if not (person.email or person.linkedin_url or person.full_name):
+        # --- There must be something we can act on. ------------------------ #
+        # Either half will do. A contact record is addressed through a person;
+        # an enrichment record (see the `website` source) is addressed through
+        # the company. Requiring both would reject every company-level lead.
+        if not (person.has_identity or company.has_identity):
             issues.append(
                 ValidationIssue(
-                    rule="no_person_identity",
-                    message="record has no email, LinkedIn URL or name",
+                    rule="no_identity",
+                    message="record has no person or company identity",
                 )
+            )
+        elif not person.has_identity:
+            # Worth knowing about, but not disqualifying: this is a company we
+            # can research, not yet a person we can write to.
+            logger.debug(
+                "company-only lead",
+                extra={"company": company.name or company.domain, "provider": lead.source.provider},
             )
 
         # --- ...and a company to attribute them to. ------------------------ #

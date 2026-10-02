@@ -24,6 +24,8 @@ from src.main import (
     EXIT_EMPTY,
     EXIT_ERROR,
     EXIT_OK,
+    build_parser,
+    build_settings,
     cli,
 )
 from src.models.lead import RawLead
@@ -164,6 +166,56 @@ class TestConfigurationErrors:
         with pytest.raises(SystemExit) as excinfo:
             cli(["--limit", "many"])
         assert excinfo.value.code == EXIT_CONFIG
+
+
+class TestSourceFlags:
+    """Per-source flags resolve into settings without a crawl being run."""
+
+    @staticmethod
+    def settings_for(argv: list[str]) -> Any:
+        parser = build_parser()
+        return build_settings(parser.parse_args(argv))
+
+    def test_website_urls_accept_repeats_and_commas(self) -> None:
+        settings = self.settings_for(
+            ["--website-url", "acme.com", "--website-url", "beta.com,gamma.com"]
+        )
+        assert settings.website.urls == ["acme.com", "beta.com", "gamma.com"]
+
+    def test_website_urls_fall_back_to_the_environment(self) -> None:
+        # An omitted flag must not clobber LEAD_WEBSITE__URLS with an empty list.
+        settings = self.settings_for([])
+        assert settings.website.urls == []
+
+    def test_bare_search_profile_means_default(self) -> None:
+        assert self.settings_for(["--search-profile"]).search_profile == "default"
+
+    def test_search_profile_takes_a_name(self) -> None:
+        assert self.settings_for(["--search-profile", "sea"]).search_profile == "sea"
+
+    def test_no_search_profile_leaves_it_unset(self) -> None:
+        assert self.settings_for([]).search_profile is None
+
+    def test_an_unknown_profile_is_a_config_error(self, capsys: pytest.CaptureFixture[str]) -> None:
+        code = cli(
+            [
+                "--source",
+                "apollo",
+                "--search-profile",
+                "nope",
+                "--search-profiles-path",
+                str(Path(__file__).resolve().parents[1] / "config" / "search_profiles.yaml"),
+                "--dry-run",
+            ]
+        )
+        assert code == EXIT_CONFIG
+        assert "unknown search profile" in capsys.readouterr().err
+
+    def test_the_website_source_is_unusable_without_urls(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert cli(["--source", "website"]) == EXIT_CONFIG
+        assert "--website-url" in capsys.readouterr().err
 
 
 class TestRuns:

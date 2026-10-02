@@ -25,12 +25,14 @@ from src.crawlers.registry import (
 
 # Imported for its registration side effect.
 from src.crawlers.apollo import ApolloCrawler  # isort: skip
+from src.crawlers.website import WebsiteCrawler  # isort: skip
 
 __all__ = [
     "ApolloCrawler",
     "BaseCrawler",
     "CsvCrawler",
     "MockCrawler",
+    "WebsiteCrawler",
     "available_providers",
     "build_crawler",
     "get_crawler_class",

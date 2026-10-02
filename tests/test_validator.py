@@ -40,7 +40,34 @@ class TestPersonIdentity:
             company_name=None,
             company_domain=None,
         )
-        assert "no_person_identity" in rules(validator.validate(lead))
+        assert "no_identity" in rules(validator.validate(lead))
+
+    def test_company_alone_is_enough(self, validator: LeadValidator) -> None:
+        # An enrichment source yields accounts, not contacts. Requiring a person
+        # would silently discard every lead the `website` source produces.
+        lead = make_lead(
+            email=None,
+            full_name=None,
+            first_name=None,
+            last_name=None,
+            company_name="Acme Corp",
+            company_domain="acme.com",
+        )
+        assert validator.validate(lead).is_valid
+
+    def test_a_website_alone_is_not_a_company_identity(self, validator: LeadValidator) -> None:
+        # We cannot name or address an organization from a URL alone, so this
+        # still counts as having no identity at all.
+        lead = make_lead(
+            email=None,
+            full_name=None,
+            first_name=None,
+            last_name=None,
+            company_name=None,
+            company_domain=None,
+        )
+        lead.company.website = "https://acme.com"
+        assert not validator.validate(lead).is_valid
 
     def test_company_signal_required(self, validator: LeadValidator) -> None:
         lead = make_lead(company_name=None, company_domain=None, email=None)
