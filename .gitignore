@@ -1,0 +1,37 @@
+# --- Secrets ---------------------------------------------------------------- #
+# Real credentials live in .env; only the template is committed.
+.env
+.env.*
+!.env.example
+
+# --- Python ----------------------------------------------------------------- #
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Virtual environments --------------------------------------------------- #
+.venv/
+venv/
+env/
+
+# --- Tooling caches --------------------------------------------------------- #
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Run artifacts ---------------------------------------------------------- #
+# Exports are generated per run; the sample input under samples/ is committed.
+data/exports/
+*.log
+
+# --- Editors / OS ----------------------------------------------------------- #
+.DS_Store
+.idea/
+.vscode/
