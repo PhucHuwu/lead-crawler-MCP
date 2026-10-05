@@ -17,7 +17,14 @@ import re
 from datetime import datetime
 from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from src.models.company import Company
 from src.models.enums import SeniorityLevel
@@ -221,6 +228,28 @@ class RawLead(BaseModel):
 
     #: Untouched upstream record, preserved for debugging and re-processing.
     raw: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("seniority", mode="before")
+    @classmethod
+    def _coerce_seniority(cls, value: object) -> object:
+        """Accept whatever vocabulary the source speaks for seniority.
+
+        Sources use their own words for this field — Apollo says ``head`` and
+        ``owner``, a spreadsheet column says ``Head of Sales`` — and none of
+        them is a value an enum lookup would accept. Rejecting them here would
+        throw away a whole record over one field, and because the mapping runs
+        inside the adapter's loop it would discard every record beside it too.
+
+        :meth:`SeniorityLevel.coerce` already knows how to place those spellings,
+        and :mod:`src.processors.normalizer` already calls it — this makes the
+        type agree with the stage that consumes it. Anything genuinely
+        unrecognised becomes ``UNKNOWN``, which the normalizer treats as absent
+        and re-derives from the job title, so nothing is claimed that the data
+        does not support.
+        """
+        if value is None or isinstance(value, SeniorityLevel):
+            return value
+        return SeniorityLevel.coerce(value)
 
     def label(self) -> str:
         """Short human-readable identifier used in logs and rejection records."""

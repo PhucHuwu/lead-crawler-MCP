@@ -7,6 +7,10 @@ Two output shapes are supported, selected by ``LOG_FORMAT``:
 
 Both render the ``extra={...}` fields passed to the logger, so pipeline stages
 can attach context (provider, counts, lead ids) without reformatting messages.
+
+Every handler also carries a redaction filter, so a credential that reaches a
+record by any route — a message, an argument, an ``extra`` field, a traceback —
+is withheld rather than printed. See :mod:`src.utils.redaction`.
 """
 
 from __future__ import annotations
@@ -14,8 +18,11 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import traceback
 from datetime import UTC, datetime
 from typing import Any
+
+from src.utils.redaction import redact
 
 # Attributes present on every LogRecord. Anything outside this set came from
 # `extra=` and is therefore application context worth emitting.
@@ -64,6 +71,46 @@ def _render_value(value: Any) -> str:
     return json.dumps(value, default=str)
 
 
+class SecretRedactingFilter(logging.Filter):
+    """Scrub registered credentials out of a record before it is rendered.
+
+    Attached to the handler rather than baked into either formatter: it then
+    runs once per record and covers every route a value can travel by — the
+    message, its ``args``, each ``extra`` field, and the traceback — so the two
+    output shapes cannot drift apart in what they protect.
+
+    The traceback is rendered here into ``exc_text`` because a formatter builds
+    it from ``exc_info`` later, by which point the filter has already run; both
+    formatters prefer ``exc_text`` when it is set.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = redact(record.msg)
+        record.args = self._redact_args(record.args)
+        for key in [key for key in record.__dict__ if key not in _RESERVED_RECORD_ATTRS]:
+            if key.startswith("_"):
+                continue
+            setattr(record, key, redact(record.__dict__[key]))
+        if record.exc_info is not None and not record.exc_text:
+            record.exc_text = redact(_render_exception(record.exc_info))
+        return True
+
+    @staticmethod
+    def _redact_args(args: object) -> object:
+        """Redact ``args``, which logging accepts as a tuple or a mapping."""
+        if isinstance(args, dict):
+            return {key: redact(value) for key, value in args.items()}
+        if isinstance(args, tuple):
+            return tuple(redact(value) for value in args)
+        return redact(args)
+
+
+def _render_exception(exc_info: Any) -> str:
+    """Render ``exc_info`` the way :mod:`logging` would, for the filter to scrub."""
+    kind, value, tb = exc_info
+    return "".join(traceback.format_exception(kind, value, tb))
+
+
 class ConsoleFormatter(logging.Formatter):
     """``15:04:05 INFO     processors.pipeline  message  key=value``"""
 
@@ -74,8 +121,10 @@ class ConsoleFormatter(logging.Formatter):
             line += "  " + " ".join(
                 f"{key}={_render_value(value)}" for key, value in extras.items()
             )
-        if record.exc_info:
+        if record.exc_info and record.exc_text is None:
             line += "\n" + self.formatException(record.exc_info)
+        elif record.exc_text:
+            line += "\n" + str(record.exc_text)
         return line
 
 
@@ -90,8 +139,10 @@ class JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
         }
         payload.update(_extras(record))
-        if record.exc_info:
+        if record.exc_info and record.exc_text is None:
             payload["exception"] = self.formatException(record.exc_info)
+        elif record.exc_text:
+            payload["exception"] = record.exc_text
         return json.dumps(payload, default=str)
 
 
@@ -105,6 +156,9 @@ def configure_logging(level: str = "INFO", fmt: str = "console", *, stream: Any 
 
     handler = logging.StreamHandler(stream or sys.stderr)
     handler.setFormatter(JsonFormatter() if fmt.casefold() == "json" else ConsoleFormatter())
+    # On the handler, so it applies to whichever formatter was chosen above and
+    # to every record that reaches it — see :class:`SecretRedactingFilter`.
+    handler.addFilter(SecretRedactingFilter())
 
     root = logging.getLogger()
     for existing in list(root.handlers):

@@ -47,6 +47,7 @@ from src.models.enums import DedupStrategy, ExportFormat, LogFormat, SeniorityLe
 from src.models.lead import is_lead_field_path
 from src.utils.errors import ConfigError
 from src.utils.numbers import parse_employee_range
+from src.utils.redaction import iter_secret_values, register_secrets
 
 
 def _split_list(value: Any) -> Any:
@@ -468,6 +469,16 @@ class Settings(BaseSettings):
                 seen.append(fmt)
         return seen
 
+    def secret_values(self) -> list[str]:
+        """Every plaintext credential this configuration holds.
+
+        Derived by walking the model for ``SecretStr`` fields rather than listed
+        by hand, so a credential added to any section is covered the moment it is
+        declared. Fed to :func:`~src.utils.redaction.register_secrets`, which is
+        what keeps them out of the logs.
+        """
+        return list(iter_secret_values(self))
+
 
 def _nested_sections() -> dict[str, type[BaseModel]]:
     """Root fields that are themselves a settings section, keyed by field name."""
@@ -579,6 +590,11 @@ def load_settings(*, env_file: str | Path | None = None, **overrides: Any) -> Se
     if env_file is not None:
         cleaned["_env_file"] = env_file
     try:
-        return Settings(**cleaned)
+        settings = Settings(**cleaned)
     except Exception as exc:  # pydantic ValidationError, wrapped for the CLI
         raise ConfigError(f"invalid configuration: {exc}") from exc
+
+    # Register the credentials before anything else can log. From here on a
+    # secret cannot reach a log record even by a route nobody anticipated.
+    register_secrets(settings.secret_values())
+    return settings
