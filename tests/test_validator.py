@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import pytest
 
+from src.models.enums import ValidationSeverity
+from src.models.lead import NormalizationIssue
 from src.processors.validator import LeadValidator
 from tests.conftest import make_lead
 
@@ -140,3 +142,100 @@ class TestOutcome:
 
     def test_valid_lead_has_no_first_rule(self, validator: LeadValidator) -> None:
         assert validator.validate(make_lead()).first_rule is None
+
+
+class TestSeverity:
+    """Validation must be able to mark a record, not only reject it.
+
+    A lead whose company domain was garbled upstream is still addressable.
+    Dropping it would discard good data to punish one bad field.
+    """
+
+    def test_every_rule_is_fatal_by_default(self, validator: LeadValidator) -> None:
+        lead = make_lead(full_name="Info")
+        assert all(
+            issue.severity is ValidationSeverity.ERROR for issue in validator.validate(lead).issues
+        )
+
+    def test_a_warning_does_not_invalidate_the_record(self, validator: LeadValidator) -> None:
+        lead = make_lead()
+        lead.normalization_issues = [
+            NormalizationIssue(rule="invalid_domain", field="company_domain", value="junk")
+        ]
+        outcome = validator.validate(lead)
+        assert outcome.is_valid
+        assert outcome.has_warnings
+        assert not outcome.errors
+
+    def test_a_warning_is_still_reported(self, validator: LeadValidator) -> None:
+        lead = make_lead()
+        lead.normalization_issues = [
+            NormalizationIssue(rule="invalid_domain", field="company_domain", value="junk")
+        ]
+        outcome = validator.validate(lead)
+        assert [issue.rule for issue in outcome.warnings] == ["invalid_domain"]
+        assert "junk" in outcome.summary()
+
+    def test_an_error_outranks_a_warning(self, validator: LeadValidator) -> None:
+        # Both at once: the record is dropped, but the warning is still visible.
+        lead = make_lead(full_name="Info", company_name=None, company_domain=None, email=None)
+        lead.normalization_issues = [
+            NormalizationIssue(rule="invalid_domain", field="company_domain", value="junk")
+        ]
+        outcome = validator.validate(lead)
+        assert not outcome.is_valid
+        assert outcome.has_warnings
+        assert outcome.first_rule != "invalid_domain"
+
+    @pytest.mark.parametrize(
+        ("rule", "expected_fragment"),
+        [
+            ("invalid_domain", "not a usable domain"),
+            ("malformed_url", "not a usable URL"),
+            ("invalid_email", "not a usable email address"),
+        ],
+    )
+    def test_each_rule_gets_its_own_phrasing(
+        self, validator: LeadValidator, rule: str, expected_fragment: str
+    ) -> None:
+        lead = make_lead()
+        lead.normalization_issues = [
+            NormalizationIssue(rule=rule, field="company_domain", value="junk")
+        ]
+        assert expected_fragment in validator.validate(lead).summary()
+
+    def test_an_unrecognised_rule_is_still_reported(self, validator: LeadValidator) -> None:
+        # A rule the normalizer adds later must not vanish just because no
+        # message template exists for it yet.
+        lead = make_lead()
+        lead.normalization_issues = [
+            NormalizationIssue(rule="brand_new_rule", field="company_city", value="junk")
+        ]
+        outcome = validator.validate(lead)
+        assert [issue.rule for issue in outcome.warnings] == ["brand_new_rule"]
+        assert "could not be normalized" in outcome.summary()
+
+
+class TestOutcomeRules:
+    def test_rules_are_deduplicated(self, validator: LeadValidator) -> None:
+        # Statistics count records affected by a rule, so two unreadable URLs is
+        # one lead with a URL problem, not two.
+        lead = make_lead()
+        lead.normalization_issues = [
+            NormalizationIssue(rule="malformed_url", field="company_website", value="a"),
+            NormalizationIssue(rule="malformed_url", field="company_contact_url", value="b"),
+        ]
+        assert validator.validate(lead).rules == ("malformed_url",)
+        assert len(validator.validate(lead).warnings) == 2
+
+    def test_rules_follow_first_seen_order(self, validator: LeadValidator) -> None:
+        lead = make_lead(full_name="Info")
+        lead.normalization_issues = [
+            NormalizationIssue(rule="invalid_domain", field="company_domain", value="junk")
+        ]
+        assert validator.validate(lead).rules == ("non_person_name", "invalid_domain")
+
+    def test_a_clean_lead_has_no_rules(self, validator: LeadValidator) -> None:
+        outcome = validator.validate(make_lead())
+        assert outcome.rules == ()
+        assert not outcome.has_warnings

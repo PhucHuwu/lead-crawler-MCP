@@ -70,6 +70,21 @@ class SeniorityLevel(StrEnum):
         return cls.UNKNOWN
 
 
+class ValidationSeverity(StrEnum):
+    """How bad a validation finding is.
+
+    Validation is asked to "reject **or mark**" a record, and the two are not
+    the same judgement. A lead with no identity at all is unusable and must go.
+    A lead whose company domain was garbled in the source is still perfectly
+    addressable — dropping it would throw away good data to punish a bad field.
+    """
+
+    #: The record cannot be used; it is dropped with this reason recorded.
+    ERROR = "error"
+    #: The record is kept, and the finding is counted and reportable.
+    WARNING = "warning"
+
+
 class DedupStrategy(StrEnum):
     """How aggressively duplicate leads are collapsed.
 
@@ -95,6 +110,23 @@ class ExportFormat(StrEnum):
     CSV = "csv"
     JSON = "json"
     JSONL = "jsonl"
+
+
+class DuplicateKind(StrEnum):
+    """How certain a duplicate match is.
+
+    The distinction is the difference between "this is the same record" and
+    "this is probably the same person". Both are collapsed, but only the first
+    is a fact — and reporting them as one number would hide how much of a run's
+    dedup was inference.
+    """
+
+    #: The same record: the source said so, or two sources gave a unique
+    #: person-level identifier (email, LinkedIn profile).
+    EXACT = "exact"
+    #: The same person, most likely: a near-unique identifier confirmed by a
+    #: name, or a name anchored to a company. Could be wrong.
+    PROBABLE = "probable"
 
 
 class RejectionReason(StrEnum):

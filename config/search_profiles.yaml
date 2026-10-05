@@ -3,8 +3,17 @@
 # A profile is a named, reusable search definition: instead of typing the same
 # six flags on every run, select a profile with `--search-profile <name>`.
 #
+# Command-line interface:
+#
 #     python -m src.main --source apollo --search-profile default --limit 100
 #     python -m src.main --source apollo --search-profile      # short for `default`
+#     python -m src.main --source apollo --profile singapore-tech  # this half + filters.yaml
+#
+# `--profile <name>` is the umbrella: it selects the profile of that name from
+# THIS file and from config/filters.yaml at once, so one name describes a whole
+# acquisition strategy. A name defined in only one of the two files is fine and
+# simply applies in one place. `--search-profile` names this half explicitly and
+# therefore wins over `--profile`.
 #
 # Resolution order, weakest first:
 #
@@ -52,6 +61,29 @@ default:
     - Singapore
     - Japan
     - Australia
+
+# The profile the README quickstart uses. It has a companion of the same name in
+# config/filters.yaml, so `--profile singapore_tech` applies both halves at once
+# (and `--profile singapore-tech` reaches it too — separators are forgiven).
+singapore_tech:
+  description: Engineering leadership at Singapore product companies.
+  titles:
+    - CTO
+    - VP Engineering
+    - Head of Engineering
+    - Head of Platform
+    - Engineering Manager
+  seniorities:
+    - c_suite
+    - vp
+    - head
+    - director
+  locations:
+    - Singapore
+  industries:
+    - information technology & services
+    - software
+    - financial services
 
 # A second profile, to show the fuller shape. Select with
 # `--search-profile sea_fintech`.

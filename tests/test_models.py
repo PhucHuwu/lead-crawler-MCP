@@ -86,12 +86,32 @@ class TestIdentityKeys:
             "phone_name",
             "name_domain",
             "name_company",
-            "lastname_domain",
         ]
+
+    def test_the_source_id_heads_the_ladder(self) -> None:
+        # A provider saying "these two records are one record" is the strongest
+        # signal there is, so it has to outrank every inferred key.
+        lead = make_lead(external_id="p-1", linkedin_url="https://www.linkedin.com/in/ada")
+        keys = lead.identity_keys()
+        assert next(iter(keys)) == "source_id"
+        assert keys["source_id"] == "test:p-1"
+
+    def test_the_source_id_is_scoped_by_provider(self) -> None:
+        # Two sources routinely use overlapping external ids; only the pair
+        # (provider, id) identifies a record.
+        assert make_lead(external_id="1", provider="a").identity_keys()["source_id"] == "a:1"
+        assert make_lead(external_id="1", provider="b").identity_keys()["source_id"] == "b:1"
 
     def test_omits_absent_signals(self) -> None:
         lead = make_lead(email=None, linkedin_url=None, company_domain=None, company_name=None)
         assert lead.identity_keys() == {}
+
+    def test_a_surname_at_a_company_is_not_an_identity(self) -> None:
+        # Two different people called Smith at one employer share a surname and a
+        # domain. Treating that as identity would merge them, so the ladder must
+        # never offer a last-name-anchored key.
+        keys = make_lead(full_name="John Smith", company_domain="acme.com").identity_keys()
+        assert "lastname_domain" not in keys
 
     def test_name_slugging_ignores_punctuation_and_case(self) -> None:
         assert slugify_identity("Ada O'Neill") == "adaoneill"
@@ -113,7 +133,7 @@ class TestFlatten:
         assert str(lead.flatten()["collected_at"]).endswith("Z")
 
     def test_enum_rendered_as_value(self) -> None:
-        assert make_lead().flatten()["seniority"] == SeniorityLevel.UNKNOWN.value
+        assert make_lead().flatten()["person_seniority"] == SeniorityLevel.UNKNOWN.value
 
 
 class TestEnrichmentColumns:
@@ -185,8 +205,29 @@ class TestCrawlStats:
         stats = CrawlStats()
         stats.validation_failed = 2
         stats.filtered_out = 3
-        stats.duplicates_removed = 1
+        stats.exact_duplicates = 1
         assert stats.total_rejected == 6
+
+    def test_duplicates_removed_is_the_sum_of_its_parts(self) -> None:
+        # Derived, so a run report can never quote a total that disagrees with
+        # the exact/probable split printed beside it.
+        stats = CrawlStats()
+        stats.exact_duplicates = 3
+        stats.probable_duplicates = 2
+        assert stats.duplicates_removed == 5
+
+    def test_dedup_before_and_after_bracket_the_stage(self) -> None:
+        stats = CrawlStats()
+        stats.records_before_deduplication = 10
+        stats.exact_duplicates = 3
+        stats.probable_duplicates = 1
+        assert stats.records_after_deduplication == 6
+
+    def test_duplicates_count_toward_the_rejected_total(self) -> None:
+        stats = CrawlStats()
+        stats.exact_duplicates = 1
+        stats.probable_duplicates = 2
+        assert stats.total_rejected == 3
 
     def test_total_rejected_counts_processor_failures(self) -> None:
         # A stage that raised on a record dropped it just as surely as a rule did.
@@ -224,6 +265,28 @@ class TestCrawlStats:
         stats.record_source_error("zeta", "boom")
         stats.record_source_error("alpha", "boom")
         assert stats.failed_providers == ["alpha", "zeta"]
+
+    def test_record_validation_tracks_per_rule(self) -> None:
+        stats = CrawlStats()
+        stats.record_validation("invalid_domain")
+        stats.record_validation("invalid_domain")
+        stats.record_validation("no_identity")
+        assert stats.per_validation_reason == {"invalid_domain": 2, "no_identity": 1}
+
+    def test_record_validation_does_not_touch_the_drop_counters(self) -> None:
+        # Rule attribution is separate from the verdict: a warning is recorded
+        # here and the record still ships.
+        stats = CrawlStats()
+        stats.record_validation("invalid_domain")
+        assert stats.validation_failed == 0
+        assert stats.validation_warned == 0
+
+    def test_warned_records_are_not_counted_as_rejected(self) -> None:
+        stats = CrawlStats()
+        stats.normalized = 10
+        stats.validation_warned = 3
+        assert stats.total_rejected == 0
+        assert stats.records_invalid == 0
 
 
 class TestLeadSource:

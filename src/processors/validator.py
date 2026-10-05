@@ -13,11 +13,22 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.models.enums import ValidationSeverity
 from src.models.lead import StandardizedLead
 from src.utils.logging import get_logger
 from src.utils.urls import email_domain, is_free_email_domain
 
 logger = get_logger(__name__)
+
+#: How to phrase a discarded value, per rule the normalizer can raise. A rule
+#: with no entry still gets reported, using the fallback below — losing the
+#: finding would be worse than phrasing it blandly.
+_ISSUE_MESSAGES: dict[str, str] = {
+    "invalid_domain": "{field} {value!r} is not a usable domain",
+    "malformed_url": "{field} {value!r} is not a usable URL",
+    "invalid_email": "{field} {value!r} is not a usable email address",
+}
+_DEFAULT_ISSUE_MESSAGE = "{field} {value!r} could not be normalized"
 
 #: Deliberately permissive: the normalizer already rejected anything obviously
 #: malformed, so this only catches values that slipped through.
@@ -55,6 +66,8 @@ class ValidationIssue(BaseModel):
 
     rule: str
     message: str
+    #: ``error`` drops the record; ``warning`` keeps it and reports the finding.
+    severity: ValidationSeverity = ValidationSeverity.ERROR
 
 
 class ValidationOutcome(BaseModel):
@@ -65,8 +78,36 @@ class ValidationOutcome(BaseModel):
     issues: list[ValidationIssue] = Field(default_factory=list)
 
     @property
+    def errors(self) -> list[ValidationIssue]:
+        return [issue for issue in self.issues if issue.severity is ValidationSeverity.ERROR]
+
+    @property
+    def warnings(self) -> list[ValidationIssue]:
+        return [issue for issue in self.issues if issue.severity is ValidationSeverity.WARNING]
+
+    @property
     def is_valid(self) -> bool:
-        return not self.issues
+        """Whether the record may continue down the pipeline.
+
+        Only errors disqualify it. Warnings are findings *about* a usable record.
+        """
+        return not self.errors
+
+    @property
+    def has_warnings(self) -> bool:
+        return bool(self.warnings)
+
+    @property
+    def rules(self) -> tuple[str, ...]:
+        """Distinct rule names, in first-seen order.
+
+        Deduplicated because statistics count *records* affected by a rule: a
+        lead with two unreadable URLs is one lead with a URL problem, not two.
+        """
+        seen: dict[str, None] = {}
+        for issue in self.issues:
+            seen.setdefault(issue.rule, None)
+        return tuple(seen)
 
     def summary(self) -> str:
         """All issue messages joined, for the rejection record."""
@@ -174,7 +215,26 @@ class LeadValidator:
                     )
                 )
 
+        # --- Values the source sent that could not be read. ------------- #
+        # Reported, never disqualifying: the record is still usable, and these
+        # are the only trace that the source sent something we threw away.
+        issues.extend(_issue_warnings(lead))
+
         return ValidationOutcome(issues=issues)
+
+
+def _issue_warnings(lead: StandardizedLead) -> list[ValidationIssue]:
+    """Turn the normalizer's discarded values into reportable findings."""
+    return [
+        ValidationIssue(
+            rule=issue.rule,
+            severity=ValidationSeverity.WARNING,
+            message=_ISSUE_MESSAGES.get(issue.rule, _DEFAULT_ISSUE_MESSAGE).format(
+                field=issue.field, value=issue.value
+            ),
+        )
+        for issue in lead.normalization_issues
+    ]
 
 
 def _domains_align(email_host: str, company_host: str) -> bool:

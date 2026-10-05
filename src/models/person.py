@@ -22,6 +22,12 @@ class Person(BaseModel):
     last_name: str | None = None
     full_name: str | None = None
     job_title: str | None = None
+    #: The title exactly as the source wrote it, kept only when cleaning changed
+    #: something. ``"VP Eng. at Acme"`` normalizes to ``"VP Eng."``; the clause
+    #: we stripped may still be evidence about the employer, so it is preserved
+    #: rather than destroyed. ``None`` means the normalized title *is* the raw
+    #: one, which is the common case and keeps exports free of duplicate columns.
+    job_title_raw: str | None = None
     seniority: SeniorityLevel = Field(default=SeniorityLevel.UNKNOWN)
     email: str | None = None
     phone: str | None = None

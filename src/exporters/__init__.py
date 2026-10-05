@@ -18,6 +18,7 @@ from src.exporters.base import (
     build_exporter,
     register_exporter,
     registered_exporters,
+    source_slug,
 )
 from src.exporters.csv_exporter import LEAD_COLUMNS, CsvExporter
 from src.exporters.json_exporter import JsonExporter, JsonLinesExporter, lead_to_dict
@@ -36,5 +37,6 @@ __all__ = [
     "lead_to_dict",
     "register_exporter",
     "registered_exporters",
+    "source_slug",
     "write_run_report",
 ]

@@ -27,16 +27,22 @@ if TYPE_CHECKING:
 #: lead) so an empty result still produces a usable header row, and so the column
 #: order never shifts between runs. ``tests/test_exporters.py`` asserts this
 #: matches :meth:`StandardizedLead.flatten`.
+#:
+#: The order groups the columns by the nested object they came from, so a
+#: reader scanning the header sees the person, then the company, then where the
+#: record came from. ``lead_id`` leads and ``completeness`` trails because both
+#: describe the record as a whole rather than any one of its parts.
 LEAD_COLUMNS: tuple[str, ...] = (
     "lead_id",
-    "first_name",
-    "last_name",
-    "full_name",
-    "job_title",
-    "seniority",
-    "email",
-    "phone",
-    "linkedin_url",
+    "person_first_name",
+    "person_last_name",
+    "person_full_name",
+    "person_job_title",
+    "person_job_title_raw",
+    "person_seniority",
+    "person_email",
+    "person_phone",
+    "person_linkedin_url",
     "company_name",
     "company_domain",
     "company_website",
@@ -51,6 +57,7 @@ LEAD_COLUMNS: tuple[str, ...] = (
     "source_provider",
     "source_external_id",
     "source_url",
+    "sources",
     "collected_at",
     "completeness",
 )

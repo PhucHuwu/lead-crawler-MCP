@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from src.models.company import Company
 from src.models.enums import SeniorityLevel
-from src.models.lead import LeadSource, RawLead, StandardizedLead
+from src.models.lead import LeadSource, NormalizationIssue, RawLead, StandardizedLead
 from src.models.person import Person
 from src.processors.geo import normalize_country
 from src.processors.seniority import infer_seniority
@@ -27,6 +27,7 @@ from src.utils.text import (
     split_full_name,
     strip_title_suffix,
     titlecase_name,
+    truncate,
 )
 from src.utils.time import ensure_utc
 from src.utils.urls import (
@@ -49,6 +50,10 @@ MAX_PLAUSIBLE_EMPLOYEES = 2_000_000
 #: every export row without adding a usable signal.
 MAX_DESCRIPTION_CHARS = 600
 
+#: Cap on the offending value echoed into a normalization issue. Long enough to
+#: recognise the input, short enough that a pasted blob cannot bloat a report.
+MAX_ISSUE_VALUE_CHARS = 200
+
 
 class Normalizer:
     """Repairs and reshapes raw leads into the standardized schema."""
@@ -64,6 +69,7 @@ class Normalizer:
         """
         person = self._normalize_person(raw)
         company = self._normalize_company(raw, person)
+        issues = _collect_issues(raw)
 
         return StandardizedLead(
             person=person,
@@ -74,6 +80,7 @@ class Normalizer:
                 source_url=clean_text(raw.source_url),
                 collected_at=ensure_utc(raw.collected_at) or raw.collected_at,
             ),
+            normalization_issues=issues,
         )
 
     # ------------------------------------------------------------------ #
@@ -94,7 +101,13 @@ class Normalizer:
             first = first or derived_first
             last = last or derived_last
 
-        job_title = strip_title_suffix(raw.job_title)
+        # Cleaned the same way as the normalized title, so the two differ only
+        # by the normalization itself and not by whitespace noise. Kept only
+        # when it says something the normalized title does not.
+        raw_title = clean_text(raw.job_title)
+        job_title = strip_title_suffix(raw_title)
+        if raw_title == job_title:
+            raw_title = None
 
         # An explicit seniority from the source is trusted; otherwise infer it
         # from the title rather than leaving the field empty.
@@ -107,6 +120,7 @@ class Normalizer:
             last_name=last,
             full_name=full,
             job_title=job_title,
+            job_title_raw=raw_title,
             seniority=seniority,
             email=normalize_email(raw.email),
             phone=normalize_phone(raw.phone),
@@ -155,6 +169,72 @@ class Normalizer:
             contact_url=normalize_page_url(raw.company_contact_url),
             social_links=social_links,
         )
+
+
+def _collect_issues(raw: RawLead) -> list[NormalizationIssue]:
+    """Record supplied values that did not survive normalization.
+
+    A field the source never sent is not a problem — it is simply absent. This
+    reports only fields that *were* sent and could not be cleaned, which is the
+    difference between "we have no domain for this company" and "the source gave
+    us a domain we could not read". Each field is re-checked against its own
+    normalizer rather than against the finished lead, because the company
+    fallbacks mean an unusable ``company_domain`` can still be papered over by a
+    usable ``company_website`` — the value would be lost without a trace.
+    """
+    issues: list[NormalizationIssue] = []
+    _note(issues, "email", "invalid_email", raw.email, normalize_email(raw.email))
+    _note(
+        issues,
+        "linkedin_url",
+        "malformed_url",
+        raw.linkedin_url,
+        # Kind "any": a company URL in the person field is a mislabelled value,
+        # not a malformed one, and reporting it as malformed would be a lie.
+        normalize_linkedin_url(raw.linkedin_url),
+    )
+    _note(
+        issues,
+        "company_domain",
+        "invalid_domain",
+        raw.company_domain,
+        normalize_domain(raw.company_domain),
+    )
+    _note(
+        issues,
+        "company_website",
+        "malformed_url",
+        raw.company_website,
+        normalize_domain(raw.company_website),
+    )
+    _note(
+        issues,
+        "company_contact_url",
+        "malformed_url",
+        raw.company_contact_url,
+        normalize_page_url(raw.company_contact_url),
+    )
+    return issues
+
+
+def _note(
+    issues: list[NormalizationIssue],
+    field: str,
+    rule: str,
+    supplied: object,
+    normalized: object,
+) -> None:
+    """Append an issue when a value was supplied but produced nothing."""
+    if normalized is not None:
+        return
+    text = clean_text(supplied)
+    if text is None:
+        # Never supplied, or a recognised "no value" marker such as "N/A".
+        # Absent is not malformed, and reporting it would drown the real issues.
+        return
+    issues.append(
+        NormalizationIssue(rule=rule, field=field, value=truncate(text, MAX_ISSUE_VALUE_CHARS))
+    )
 
 
 def _truncate_description(value: object) -> str | None:

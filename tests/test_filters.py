@@ -104,6 +104,98 @@ class TestPerson:
         assert build(include_title_keywords=["engineer"]).evaluate(lead).passed is False
 
 
+class TestTitles:
+    """The exact title lists, as distinct from the keyword rules."""
+
+    def test_whole_title_match_accepts_the_title(self) -> None:
+        lead = make_lead(job_title="CTO")
+        assert build(include_titles=["CTO"]).evaluate(lead).passed is True
+
+    def test_whole_title_match_is_case_insensitive(self) -> None:
+        lead = make_lead(job_title="CTO")
+        assert build(include_titles=["cto"]).evaluate(lead).passed is True
+
+    def test_a_longer_title_is_not_a_match(self) -> None:
+        # This is the whole point of an exact list: a keyword rule would let the
+        # assistant through, and an assistant is not a decision maker.
+        lead = make_lead(job_title="Assistant to the CTO")
+        assert build(include_titles=["CTO"]).evaluate(lead).passed is False
+
+    def test_punctuation_is_significant(self) -> None:
+        # Casefolding, not punctuation-stripping: C++ and C are different jobs,
+        # and a rule that conflated them would accept the wrong people silently.
+        lead = make_lead(job_title="C++ Developer")
+        assert build(include_titles=["C++ Developer"]).evaluate(lead).passed is True
+        assert build(include_titles=["C Developer"]).evaluate(lead).passed is False
+
+    def test_whitespace_is_collapsed(self) -> None:
+        lead = make_lead(job_title="VP  Engineering")
+        assert build(include_titles=["VP Engineering"]).evaluate(lead).passed is True
+
+    def test_excluded_title_is_dropped(self) -> None:
+        lead = make_lead(job_title="Intern")
+        decision = build(exclude_titles=["Intern"]).evaluate(lead)
+        assert decision.passed is False
+        assert decision.rule == "exclude_titles"
+
+    def test_exclusion_beats_inclusion(self) -> None:
+        # A title in both lists is a contradiction; resolving it the same way
+        # every time is what keeps the attribution deterministic.
+        lead = make_lead(job_title="CTO")
+        assert build(include_titles=["CTO"], exclude_titles=["CTO"]).evaluate(lead).passed is False
+
+    def test_missing_title_fails_only_an_allow_list(self) -> None:
+        lead = make_lead(job_title=None)
+        assert build(exclude_titles=["Intern"]).evaluate(lead).passed is True
+        assert build(include_titles=["CTO"]).evaluate(lead).passed is False
+
+    def test_title_lists_are_independent_of_keywords(self) -> None:
+        # An exact entry that the keyword rules would not have matched.
+        lead = make_lead(job_title="Head of Engineering")
+        assert build(include_titles=["Head of Engineering"]).evaluate(lead).passed is True
+
+
+class TestRequiredFields:
+    def test_a_present_field_passes(self) -> None:
+        assert build(required_fields=["company.name"]).evaluate(make_lead()).passed is True
+
+    def test_a_missing_field_is_dropped(self) -> None:
+        decision = build(required_fields=["company.name"]).evaluate(make_lead(company_name=None))
+        assert decision.passed is False
+        assert decision.rule == "require_company_name"
+
+    def test_each_path_is_attributed_separately(self) -> None:
+        filter_ = build(required_fields=["company.name", "person.linkedin_url"])
+        assert filter_.evaluate(make_lead(linkedin_url="https://x.test/in/ada")).passed is True
+        assert filter_.evaluate(make_lead()).rule == "require_person_linkedin_url"
+
+    def test_nested_and_scalar_paths_both_resolve(self) -> None:
+        assert build(required_fields=["company.country"]).evaluate(make_lead()).passed is True
+        assert (
+            build(required_fields=["company.country"]).evaluate(make_lead(country=None)).passed
+            is False
+        )
+
+    def test_zero_is_a_value_not_a_gap(self) -> None:
+        # A company with no employees on record is a fact, not an omission.
+        lead = make_lead(employee_count=0)
+        assert build(required_fields=["company.employee_count"]).evaluate(lead).passed is True
+
+    def test_an_unknown_seniority_does_not_satisfy_a_requirement(self) -> None:
+        # UNKNOWN is the absence of a fact, unlike 0, so it must fail the rule.
+        assert build(required_fields=["person.seniority"]).evaluate(make_lead()).passed is False
+
+    def test_a_path_that_is_not_a_field_is_rejected(self) -> None:
+        # Louder than a rule that never fires: a typo must not produce a clean run.
+        with pytest.raises(Exception, match="not a field on the lead"):
+            FilterSettings(required_fields=["company.nmae"])
+
+    def test_required_fields_run_before_whole_title_rules(self) -> None:
+        lead = make_lead(company_name=None, job_title="Designer")
+        decision = build(required_fields=["company.name"], include_titles=["CTO"]).evaluate(lead)
+        assert decision.rule == "require_company_name"
+
+
 class TestContactability:
     def test_require_email(self) -> None:
         assert build(require_email=True).evaluate(make_lead(email=None)).passed is False

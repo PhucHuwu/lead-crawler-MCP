@@ -64,7 +64,7 @@ class TestLoading:
 
     def test_an_empty_file_is_reported(self, tmp_path: Path) -> None:
         path = write_profiles(tmp_path, "")
-        with pytest.raises(ConfigError, match="contains no profiles"):
+        with pytest.raises(ConfigError, match="contains no search profiles"):
             load_search_profiles(path)
 
     def test_a_non_mapping_document_is_reported(self, tmp_path: Path) -> None:
@@ -123,6 +123,27 @@ class TestValidation:
     def test_blank_entries_are_dropped(self, tmp_path: Path) -> None:
         path = write_profiles(tmp_path, "default:\n  titles: ['CTO', '  ', '']\n")
         assert load_search_profiles(path)["default"].titles == ["CTO"]
+
+
+class TestNameNormalization:
+    def test_a_hyphenated_spelling_reaches_an_underscored_name(self, tmp_path: Path) -> None:
+        # The name is written in the file and typed at a shell, so it is spelled
+        # two ways by definition.
+        path = write_profiles(tmp_path, "sea_fintech:\n  titles: [CTO]\n")
+        assert get_search_profile("sea-fintech", path=path) is not None
+
+    def test_names_differing_only_in_punctuation_are_rejected(self, tmp_path: Path) -> None:
+        # They normalize to one key, so the second would silently replace the
+        # first — a profile that quietly does not apply is the failure this
+        # module exists to prevent.
+        path = write_profiles(
+            tmp_path, "sea_fintech:\n  titles: [CTO]\nsea-fintech:\n  titles: [CIO]\n"
+        )
+        with pytest.raises(ConfigError) as excinfo:
+            load_search_profiles(path)
+        message = str(excinfo.value)
+        assert "sea_fintech" in message
+        assert "sea-fintech" in message
 
 
 class TestEmptiness:

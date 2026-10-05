@@ -13,7 +13,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict
 
 from src.config import FilterSettings
-from src.models.lead import StandardizedLead
+from src.models.lead import StandardizedLead, is_empty_value, resolve_field_path
 from src.processors.geo import country_matches
 from src.utils.urls import email_domain, is_free_email_domain
 
@@ -61,6 +61,12 @@ class LeadFilter:
         self._included_title_keywords = [
             k.strip().casefold() for k in criteria.include_title_keywords if k.strip()
         ]
+        # Explicit title lists match the whole title, so whitespace is collapsed
+        # to make "VP  Engineering" and "VP Engineering" the same entry rather
+        # than two that silently differ.
+        self._included_titles = {_titled(t) for t in criteria.include_titles if t.strip()}
+        self._excluded_titles = {_titled(t) for t in criteria.exclude_titles if t.strip()}
+        self._required_paths = [p.strip() for p in criteria.required_fields if p.strip()]
         self._role_prefixes = {
             p.strip().casefold().rstrip("@")
             for p in criteria.role_based_email_prefixes
@@ -74,11 +80,13 @@ class LeadFilter:
             self._check_excluded_domain,
             self._check_excluded_email_domain,
             self._check_required_fields,
+            self._check_required_paths,
             self._check_email_quality,
             self._check_country,
             self._check_industry,
             self._check_size,
             self._check_seniority,
+            self._check_titles,
             self._check_title_keywords,
         ):
             decision = check(lead)
@@ -218,6 +226,47 @@ class LeadFilter:
             )
         return None
 
+    def _check_required_paths(self, lead: StandardizedLead) -> FilterDecision | None:
+        """Reject a lead missing any field named in ``required_fields``.
+
+        Each path is attributable on its own — the rule name is the path with
+        dots folded to underscores (``company.name`` -> ``require_company_name``)
+        so ``per_filter_reason`` says *which* requirement emptied the run rather
+        than lumping them all under one counter.
+        """
+        for path in self._required_paths:
+            if is_empty_value(resolve_field_path(lead, path)):
+                return FilterDecision.drop(
+                    f"require_{path.replace('.', '_')}",
+                    f"{path} is missing",
+                )
+        return None
+
+    def _check_titles(self, lead: StandardizedLead) -> FilterDecision | None:
+        """Apply the explicit title lists, matching the whole title.
+
+        Exact matching is the point: a keyword list would let ``CTO`` through on
+        "Assistant to the CTO", which is a different job. The normalized title is
+        what is compared, so ``CTO at Acme Corp`` has already been reduced to
+        ``CTO`` before this runs.
+        """
+        title = lead.person.job_title
+        if not title:
+            # As with industries: an absent title can fail an allow-list, but a
+            # deny-list cannot rule out a title it cannot see.
+            if self._included_titles:
+                return FilterDecision.drop("include_titles", "job title unknown")
+            return None
+
+        normalized = _titled(title)
+        if normalized in self._excluded_titles:
+            return FilterDecision.drop("exclude_titles", f"job title {title!r} is excluded")
+        if self._included_titles and normalized not in self._included_titles:
+            return FilterDecision.drop(
+                "include_titles", f"job title {title!r} is not in the accepted list"
+            )
+        return None
+
     def _check_title_keywords(self, lead: StandardizedLead) -> FilterDecision | None:
         title = lead.person.job_title
         if not title:
@@ -245,3 +294,15 @@ def _matches_domain(domain: str, patterns: set[str]) -> bool:
     if domain in patterns:
         return True
     return any(domain.endswith(f".{pattern}") for pattern in patterns)
+
+
+def _titled(value: str) -> str:
+    """Reduce a job title to a comparable form: casefolded, whitespace-collapsed.
+
+    Punctuation is deliberately *kept*, unlike in a name slug. Dropping it would
+    make ``C++ Developer`` and ``C Developer`` the same entry — a rule that
+    silently accepted the wrong people. The cost is that ``VP, Engineering`` and
+    ``VP Engineering`` are two entries, which is visible in the config file a
+    person edits, unlike a wrong match, which is not.
+    """
+    return " ".join(value.split()).casefold()

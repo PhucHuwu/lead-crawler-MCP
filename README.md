@@ -49,10 +49,10 @@ export LEAD_APOLLO__API_KEY=...
 lead-crawler --source apollo --limit 100
 ```
 
-Output lands in `data/exports/` as `<prefix>_<UTC timestamp>.<ext>` plus a
-`_report.json` run report; `--output` overrides that with an exact path (see
-[Where the output goes](#where-the-output-goes)). Logs go to **stderr**, the run
-summary to **stdout**, so `--log-format json` composes cleanly with a shell
+Output lands in `data/exports/` as `<prefix>_<source>_<UTC timestamp>.<ext>` plus a
+matching `_report.json` run report; `--output` overrides that with an exact path
+(see [Where the output goes](#where-the-output-goes)). Logs go to **stderr**, the
+run summary to **stdout**, so `--log-format json` composes cleanly with a shell
 pipeline.
 
 ---
@@ -76,7 +76,7 @@ src/
 │   └── enums.py       SeniorityLevel, DedupStrategy, RejectionReason, …
 ├── processors/
 │   ├── normalizer.py   raw record → canonical types (phones, URLs, countries…)
-│   ├── validator.py    drops records with no usable identity
+│   ├── validator.py    rejects records with no usable identity, flags the rest
 │   ├── filters.py      the opt-in qualification rules
 │   ├── deduplicator.py identity-ladder matching + field-level merging
 │   ├── pipeline.py     wires the stages, isolates source failures, counts
@@ -116,7 +116,25 @@ and is read from the environment with a `LEAD_` prefix. No credential is ever
 hardcoded; the Apollo key is a `SecretStr` that cannot be logged or serialized by
 accident. CLI flags override individual values for one run, and an *omitted* flag
 never clobbers an environment value (`--flag` / `--no-flag` pairs default to
-`None`).
+`None`). Two layers of named YAML profiles sit on top for the things that are
+really campaign assets rather than per-operator knobs — *what to search for*
+(`config/search_profiles.yaml`) and *which results to keep*
+(`config/filters.yaml`). Neither is read unless a profile is named, so both are
+inert by default.
+
+The split is deliberate: **secrets and environment-specific values go in the
+environment; crawler behaviour goes in YAML.** A credential must never be
+committed, and a targeting rule must be reviewable in a diff — so the two never
+share a file. `--profile NAME` ties the halves together by resolving one name
+across both files at once.
+
+The `LEAD_` prefix is enforced in both directions. Because settings are read by
+prefix, `APOLLO_API_KEY=sk-live-…` would otherwise be accepted and silently
+ignored — indistinguishable from having no key at all, which is the worst
+possible way for a run to fail. Any name the tool recognises in a spelling it
+does not read (the bare field name `LOG_LEVEL`, the single-underscore nested form
+`LEAD_APOLLO_API_KEY`, the bare section form `APOLLO_API_KEY`) stops the run with
+exit code 2 and names the variable to use instead.
 
 **3. Failures are contained and attributed.** Sources are crawled concurrently.
 A source that raises — even an untyped `RuntimeError` from a third-party library
@@ -138,6 +156,13 @@ a log pipeline can index a whole run without parsing prose.
 identity keys, so the same input yields the same IDs across runs. That is what
 makes a later phase able to diff two runs and see what changed. The `mock`
 source is seeded for the same reason.
+
+`stable_id()` deliberately omits `source_id` from its basis even though the dedup
+ladder leads with it: a source id identifies a *record at a source*, whereas
+`lead_id` identifies a *person*, and the same person found through two sources
+has two different source ids. Feeding one into the other would give two ids to one
+person, which is the thing the id exists to prevent. Deduplication walks the full
+ladder; the id walks it minus that one key.
 
 **6. Atomic writes.** Exports go to a sibling temp file and are renamed into
 place, so a crash or a full disk never leaves a half-written file that looks
@@ -204,6 +229,30 @@ python -m src.main -s apollo --search-profile default --limit 300
 python -m src.main -s apollo --search-profile sea_fintech --limit 300
 python -m src.main -s apollo --search-profile --search-profiles-path ./team.yaml
 
+# One name for a whole acquisition strategy: --profile looks the name up in the
+# search file AND the filter file, so it selects who to look for and which of
+# them to keep. A name defined in only one of the two files is fine and applies
+# in only one place. Separators are forgiven, so the hyphenated spelling works.
+python -m src.main -s apollo --profile singapore_tech --limit 300
+python -m src.main -s apollo --profile singapore-tech --limit 300
+
+# Which results to KEEP is a separate profile, and one flag replaces the whole
+# set of --countries/--min-employees/--titles flags.
+python -m src.main -s apollo --search-profile default --filter-profile default
+python -m src.main -s csv --csv-path leads.csv --filter-profile enterprise_na
+python -m src.main -s csv --csv-path leads.csv --list-filter-profiles
+python -m src.main --list-profiles        # both files, and the halves each covers
+
+# A profile is the base; an explicit flag still overrides one rule of it — and an
+# explicitly named half overrides the umbrella for that half only.
+python -m src.main -s csv --csv-path leads.csv --filter-profile --min-employees 5
+python -m src.main -s apollo --profile singapore_tech --filter-profile enterprise_na
+
+# Whole-title match: "CTO" here, not "Assistant to the CTO". Paths under
+# --required-fields are validated against the model, so a typo fails loudly.
+python -m src.main -s csv --csv-path leads.csv \
+  --titles "CTO,VP Engineering" --required-fields company.name,person.email
+
 # Enrich companies from their own public websites — one record per site.
 python -m src.main -s website --website-url acme.com --website-url beta.example
 python -m src.main -s website --website-url acme.com,beta.example --format jsonl
@@ -220,13 +269,56 @@ python -m src.main -s apollo,website --search-profile default \
 | Flag | Writes | Use it when |
 | ---- | ------ | ----------- |
 | `--output PATH` (`-o`) | Exactly `PATH`, plus `PATH` with `_report` appended | A downstream job knows the path it wants to read |
-| `--output-dir DIR` | `<prefix>_<UTC timestamp>.<ext>` per format | You want to keep every run's output side by side |
+| `--output-dir DIR` | `<prefix>_<source>_<UTC timestamp>.<ext>` per format | You want to keep every run's output side by side |
+
+A `--source apollo` run at 14:03:22 UTC on 2026-10-05 therefore writes:
+
+```
+data/exports/leads_apollo_2026-10-05_14-03-22.csv
+data/exports/leads_apollo_2026-10-05_14-03-22.json
+data/exports/leads_apollo_2026-10-05_14-03-22_report.json
+```
+
+Every format of one run shares a stem, so a file's name alone says which run and
+which source produced it. The source component is the run's providers, sorted and
+hyphen-joined (`leads_apollo-website_...`) so the same set of sources always
+yields the same name regardless of the order they were listed; a source that
+failed before returning anything is still named. `LEAD_OUTPUT_PREFIX` replaces the
+leading `leads`. The timestamp is UTC and uses `-` rather than `:` in the time
+because a colon is not a legal filename character on Windows.
 
 `--output` requires a single `--format` — one path cannot hold two
 serializations — and a missing parent directory is created for you. Because the
 default is `csv,json`, `--output` on its own is a configuration error; pass
 `--format` explicitly. With `--output` the run report lands next to your file as
 `<stem>_report.json` rather than being timestamped.
+
+### What the exports contain
+
+**Encoding.** Every file is UTF-8. CSV additionally carries a BOM by default
+(`LEAD_OUTPUT_ENCODING=utf-8-sig`) because Excel otherwise guesses the codepage
+and mangles non-ASCII names; set `LEAD_OUTPUT_ENCODING=utf-8` for a consumer that
+would treat the BOM as data. JSON and JSONL are UTF-8 without a BOM and are
+written with `ensure_ascii=False`, so Vietnamese, CJK and other non-Latin text
+appears literally rather than as `\uXXXX` escapes — the files stay greppable and
+readable. Text is NFKC-normalized on the way in, so the same name arriving
+composed from one source and decomposed from another lands on one string instead
+of two.
+
+**Column names.** CSV flattens the nested model into one row per lead, prefixed by
+the object each field came from — `person_*`, `company_*`, `source_*` — with
+`lead_id` and `completeness` unprefixed because they describe the record as a
+whole. `LEAD_COLUMNS` in `src/exporters/csv_exporter.py` is the canonical order,
+and a test asserts it still matches the model, so a field cannot be silently
+dropped. JSON keeps the nested structure (`person` / `company` / `source`) and is
+the lossless format; CSV is the spreadsheet one.
+
+**The run report.** A JSON sidecar with a flat `summary` first —
+`source`, `started_at`, `finished_at`, `discovered`, `valid`, `filtered`,
+`duplicates_removed`, `exported`, `errors` — followed by the detail: the full
+counter set, the deduplication breakdown, per-source counts and errors, and a
+sample of which filter rule rejected what. It holds no credentials and is meant
+to be attached to a ticket when a run returns fewer leads than expected.
 
 `--verbose` (`-v`) is shorthand for `--log-level DEBUG`. It adds the effective
 configuration (secrets excluded) and one `lead rejected` line per dropped
@@ -243,7 +335,9 @@ than you expected. It and `--log-level` are mutually exclusive.
 | 3 | Every requested source failed |
 | 4 | `--fail-on-empty` was set and no leads were produced |
 
-Discoverability: `--list-sources` and `--list-formats`.
+Discoverability: `--list-sources`, `--list-formats`, `--list-profiles` and
+`--list-filter-profiles`. Each prints what is available and exits 0 without
+crawling.
 
 ---
 
@@ -252,6 +346,15 @@ Discoverability: `--list-sources` and `--list-formats`.
 All optional; the defaults are production-sane. Copy `.env.example` to `.env` to
 start. Nested settings use a double underscore (`LEAD_<SECTION>__<FIELD>`), and
 list-valued settings accept either `US,CA` or `["US","CA"]`.
+
+The prefix is not advisory. A variable this tool recognises in a spelling it does
+not read stops the run with exit code 2 and names the correct variable — the
+bare name (`APOLLO_API_KEY`), the single-underscore nested form
+(`LEAD_APOLLO_API_KEY`) and the bare section form all count. Ignoring a
+mistyped secret would be indistinguishable from having none. Names that are not
+this tool's business (`AWS_PROFILE`, `HTTP_PROXY`) are left alone, and a stray
+name is tolerated when the correct one is also set. Secrets belong only in the
+environment; `config/*.yaml` holds behaviour and never a credential.
 
 ### Runtime and output
 
@@ -266,9 +369,14 @@ list-valued settings accept either `US,CA` or `["US","CA"]`.
 | `LEAD_OUTPUT_FORMATS` | `csv,json` | `csv`, `json`, `jsonl` |
 | `LEAD_OUTPUT_PREFIX` | `leads` | Filename prefix |
 | `LEAD_OUTPUT_CSV_DELIMITER` | `,` | `;` for European locales |
-| `LEAD_OUTPUT_ENCODING` | `utf-8-sig` | BOM included so Excel detects UTF-8 |
+| `LEAD_OUTPUT_ENCODING` | `utf-8-sig` | UTF-8 with a BOM so Excel detects it |
 | `LEAD_WRITE_RUN_REPORT` | `true` | Write the `_report.json` beside the leads |
 | `LEAD_MAX_RECORDED_REJECTIONS` | `1000` | Sample size; counters stay exact |
+| `LEAD_PROFILE` | *(none)* | Umbrella profile: one name, both halves below |
+| `LEAD_SEARCH_PROFILE` | *(none)* | Named Apollo search profile; unset loads no file |
+| `LEAD_SEARCH_PROFILES_PATH` | `config/search_profiles.yaml` | Where search profiles live |
+| `LEAD_FILTER_PROFILE` | *(none)* | Named qualification profile; unset loads no file |
+| `LEAD_FILTER_PROFILES_PATH` | `config/filters.yaml` | Where filter profiles live |
 
 ### Processing
 
@@ -302,8 +410,10 @@ Every rule is opt-in; with defaults the pipeline keeps everything that validates
 | `LEAD_FILTERS__EXCLUDE_DOMAINS` | *(empty)* | Competitors / existing customers |
 | `LEAD_FILTERS__INCLUDE_SENIORITY` | *(empty)* | `c_suite,vp,director,manager,senior,entry` |
 | `LEAD_FILTERS__EXCLUDE_SENIORITY` | *(empty)* | Inverse of the above |
+| `LEAD_FILTERS__INCLUDE_TITLES` / `EXCLUDE_TITLES` | *(empty)* | Whole-title match, case-insensitive |
 | `LEAD_FILTERS__INCLUDE_TITLE_KEYWORDS` | *(empty)* | Title must contain one |
 | `LEAD_FILTERS__EXCLUDE_TITLE_KEYWORDS` | *(empty)* | Title must contain none |
+| `LEAD_FILTERS__REQUIRED_FIELDS` | *(empty)* | Dotted paths that must carry a value |
 | `LEAD_FILTERS__EXCLUDE_EMAIL_DOMAINS` | *(empty)* | Drop these email domains |
 | `LEAD_FILTERS__ROLE_BASED_EMAIL_PREFIXES` | ~30 common inboxes | Override the shared-inbox list |
 
@@ -354,8 +464,8 @@ as the next band. A JSON array may still use the real Apollo spelling,
 ### Named search profiles
 
 Search criteria are a campaign's data, not a shell incantation, so they can live
-in a YAML file next to the code. `config/search_profiles.yaml` ships three
-profiles — `default`, `sea_fintech` and `enterprise_apac`:
+in a YAML file next to the code. `config/search_profiles.yaml` ships four
+profiles — `default`, `singapore_tech`, `sea_fintech` and `enterprise_apac`:
 
 ```yaml
 default:
@@ -392,6 +502,133 @@ means `default`. An unknown profile name, an unknown field, or an unparseable
 band is a configuration error (exit 2) raised *before* any request is made — a
 typo costs you a message, not a quota.
 
+### Named filter profiles
+
+*What to search for* lives in a search profile; *which results to keep* lives in
+a **filter profile**. Same idea, different file: an ICP is a campaign's shared,
+reviewed asset, so `config/filters.yaml` holds it rather than a shell history
+full of `--min-employees`:
+
+```yaml
+default:
+  description: Decision makers at established companies.
+  allowed_titles: [CTO, VP Engineering, Head of Engineering, Founder]
+  seniority: [founder, c_suite, vp]
+  minimum_employee_count: 10
+  maximum_employee_count: 1000
+  required_fields: [company.name]
+
+enterprise_na:
+  allowed_countries: [US, CA]
+  blocked_titles: [Intern, Assistant]
+  seniority: [c_suite, vp, director]
+  minimum_employee_count: 200
+  exclude_free_email: true
+  exclude_role_based_email: true
+  required_fields: [company.name, person.email]
+```
+
+The file reads as a policy document, so its vocabulary is plainer than the
+internal one — both spellings describe the same rule:
+
+| Profile key | Setting |
+| ----------- | ------- |
+| `allowed_titles` / `blocked_titles` | `include_titles` / `exclude_titles` |
+| `allowed_countries` / `blocked_countries` | `include_countries` / `exclude_countries` |
+| `seniority` / `blocked_seniority` | `include_seniority` / `exclude_seniority` |
+| `industries` / `blocked_industries` | `include_industries` / `exclude_industries` |
+| `minimum_employee_count` / `maximum_employee_count` | `min_employees` / `max_employees` |
+| `blocked_domains` | `exclude_domains` |
+| `required_fields`, `exclude_free_email`, `exclude_role_based_email` | unchanged |
+
+Selection order, weakest to strongest:
+
+1. `LEAD_FILTERS__*` — the environment defaults
+2. the named profile — a **complete** rule set, not a delta
+3. CLI flags — override individual rules
+
+Two deliberate differences from search profiles:
+
+- **A profile replaces the environment's rules rather than layering onto them.**
+  A search profile is a query delta; a filter profile is a statement of which
+  leads we keep. Merging it with whatever happened to be exported in the shell
+  would make the same named profile mean different things on different machines,
+  which defeats the point of naming it. Explicit flags still win, so a one-off
+  run can narrow a shared profile without editing the file.
+- **The file is inert unless named.** With no `--filter-profile` and no
+  `LEAD_FILTER_PROFILE`, nothing is read at all — a missing or malformed file
+  cannot break a run that never asked for it. Naming a profile resolves it
+  eagerly, so a typo fails before the crawl rather than after.
+
+`--filter-profile` with no value means `default`. `--list-filter-profiles` prints
+what a file defines; `--filter-profiles-path` (or `LEAD_FILTER_PROFILES_PATH`)
+points somewhere else. An unknown profile name, an unknown key, a bad dotted
+path, a headcount band that runs backwards or a seniority outside the shared
+vocabulary is exit 2.
+
+### One name, both halves
+
+The two files answer two halves of one question. `--profile NAME` is the umbrella
+that selects both at once:
+
+```bash
+python -m src.main --source apollo --profile singapore_tech
+```
+
+`singapore_tech` is defined in *both* files, so that one command searches for
+Singapore engineering leaders and keeps only those that fit the ICP. The two
+halves stay in their own files — a targeting definition needs to be readable to
+whoever owns the targeting, a qualification rule to whoever owns the ICP — and a
+profile is not a third document to keep in sync: it is the same name looked up in
+both.
+
+A name defined in only one file is a legitimate strategy, not a broken one. Such
+a name contributes only that half and leaves the other exactly as configured, and
+a note is logged so the asymmetry is visible:
+
+```
+profile 'sea_fintech' defines no filters half; filters settings are left as configured
+```
+
+Resolution order, weakest first:
+
+```
+LEAD_PROFILE  <  --profile  <  --search-profile / --filter-profile
+```
+
+An explicitly named half is the more specific request and wins, so a one-off run
+can keep a strategy's search and swap its qualification rules without editing a
+file. `--list-profiles` shows what both files define and which halves each name
+covers — the point being to see at a glance that `sea_fintech` is search-only:
+
+```
+Profiles in config/search_profiles.yaml and config/filters.yaml:
+
+  default              search+filters
+  enterprise_apac      search
+  enterprise_na        filters
+  sea_fintech          search
+  singapore_tech       search+filters
+```
+
+Names are matched loosely: case, surrounding whitespace and the joining
+character are all forgiven, so `singapore_tech`, `Singapore Tech` and
+`singapore-tech` reach the same profile. Only the *joining* character — `de-fault`
+is not `default` and will not silently become it. A file that defines two names
+differing only in punctuation is rejected, because they would collapse to one key
+and the second would silently replace the first.
+
+Unknown names fail before any request is made, and the message carries the
+alternatives and the files searched, since the usual cause is a typo and neither
+file is open in front of whoever reads the error:
+
+```
+configuration error: unknown profile 'singapore-techh'; searched
+config/search_profiles.yaml and config/filters.yaml. Available profiles:
+default (search+filters), singapore_tech (search+filters), sea_fintech (search),
+enterprise_apac (search), enterprise_na (filters)
+```
+
 ### The website source
 
 `website` is an enrichment adapter, not a directory: you give it company domains
@@ -412,6 +649,199 @@ it uses the standard library parser and adds no scraping dependency. The
 company's first published mailbox is placed in the person email field — the
 schema's only address slot — and every address found is preserved verbatim in
 the record's `raw` payload.
+
+---
+
+## The processing layer
+
+Every source, whatever its shape, is funneled into one schema by four stages
+that run in a fixed order: **normalize → validate → filter → deduplicate**.
+
+### Normalization
+
+`src/processors/normalizer.py` turns a `RawLead` (whatever the adapter scraped
+or fetched) into a `StandardizedLead`. Adapters deliberately return values
+un-cleaned; cleaning is this stage's job, not theirs.
+
+| Field | What normalization does |
+| ----- | ----------------------- |
+| Person names | Trims, collapses internal whitespace, NFKC-folds and removes zero-width characters, then title-cases only what looks shouted (`ADA` → `Ada`, `McDonald` and `eBay` left alone) |
+| Name parts | Reconciles `full_name` against `first`/`last` in both directions, so either representation can be the one the source supplied |
+| Emails | Lowercased, trimmed, `mailto:` and `Name <addr>` wrappers stripped, syntax-checked. No mailbox is ever contacted — Phase 1 does not verify deliverability |
+| Domains | `https://www.example.com/`, `http://example.com/path` and `www.example.com` all become `example.com`. Subdomains survive (`careers.acme.com`), ports and paths do not |
+| URLs | Canonical `https://host/path`, with campaign parameters stripped (see below) but meaningful query parameters kept |
+| Job titles | Whitespace normalized and a trailing employer clause removed (`CTO at Acme Corp` → `CTO`) |
+| Countries | Aliases and native spellings mapped to ISO 3166-1 alpha-2 (`usa`, `United States`, `Deutschland` → `US`, `DE`). An unrecognised country passes through rather than being dropped |
+| Phones | E.164-shaped: punctuation stripped, `00` prefix converted to `+`. Not a full libphonenumber port |
+| Headcount | Bands take the **lower** bound (`201-500` → `201`) so a company is never overstated |
+
+**Tracking parameters are dropped, not the whole query.** `utm_*`, `fbclid`,
+`gclid`, `msclkid`, `mc_*`, `_hs*`, `pk_*` and their relatives exist only to
+attribute a click, so two exports of the same page would otherwise differ. The
+deliberately narrow list lives in `src/utils/urls.py` (`TRACKING_PARAMS` /
+`TRACKING_PARAM_PREFIXES`). Parameters that merely *look* like tracking — `ref`,
+`source`, `si` — are **kept**, because they are just as often real page
+selectors (`?source=careers`) and a wrong guess points a lead at the wrong page.
+
+**Both raw and normalized values are kept where the difference matters.** A job
+title is normalized into `person.job_title`, and the original is preserved as
+`person.job_title_raw` — but *only when cleaning actually changed something*, so
+a plain `VP Engineering` leaves `job_title_raw` empty instead of duplicating the
+column beside it. `CTO at Acme Corp` exports as `person_job_title=CTO`,
+`person_job_title_raw=CTO at Acme Corp`; the stripped clause may still be evidence
+about the employer.
+
+### Validation: reject *or* mark
+
+`src/processors/validator.py` returns a `ValidationOutcome` carrying individual
+`ValidationIssue`s, each with a `severity`:
+
+- `ERROR` — the record cannot be used and is dropped. Absent identity, an
+  implausible or department name, a malformed address, an email that contradicts
+  the company domain.
+- `WARNING` — the record is usable, so it is **kept and flagged**.
+
+Warnings come from a specific place: a value the source sent that the normalizer
+could not read. Those are recorded on the lead as `normalization_issues` (rule,
+field, offending value) and converted into warnings by the validator. This
+matters because normalization can mask a loss — a garbled `company_domain` plus
+a readable `company_website` still yields a good lead, and without the issue list
+the garbled field would be invisible.
+
+Absent values are **not** issues. `None`, `""`, `"n/a"` and `"-"` mean "the
+source had nothing", which is different from "the source sent something broken",
+and conflating the two would bury the real problems.
+
+`normalization_issues` is intentionally excluded from `flatten()`, from
+`completeness` and from `identity_keys()`: it is a quality note *about* the
+record, not part of it, and it must never change how a lead ranks or what it
+matches on.
+
+Warnings are never silent. A warned record stays out of `validation_failed`,
+`records_invalid` and `total_rejected` — nothing was dropped — and is counted
+instead in:
+
+| Signal | Where |
+| ------ | ----- |
+| `stats.validation_warned` | Count of kept-but-flagged records (a subset of `normalized`) |
+| `stats.per_validation_reason` | Rule name → records that raised it, errors and warnings alike |
+| `run summary` log | `records_warned` and `validation_rules` keys, JSON-serializable |
+| CLI summary | A `flagged (kept)` line and a `validation rules:` breakdown |
+| `--verbose` | One `lead flagged` DEBUG line per record, naming the lead and why |
+
+Attribution is per *record*, not per firing: two unreadable URLs on one lead is
+one lead with a URL problem, so `per_validation_reason` answers "which checks are
+noisy?" rather than counting raw issue objects.
+
+### Filtering
+
+Filters are opt-in qualification rules covering geography, firmographics,
+seniority, job titles and contactability — see the `LEAD_FILTERS__*` table above.
+With every default in place nothing is filtered, because filtering is a
+deliberate narrowing and never a surprise.
+
+Two families of rule are worth telling apart, because both look like "filter by
+title" and they mean different things:
+
+| Rule | Match | `CTO` selects | Use it when |
+| ---- | ----- | ------------- | ----------- |
+| `include_titles` / `exclude_titles` | whole normalized title | `CTO`, `cto` | You know the exact titles you want |
+| `include_title_keywords` / `exclude_title_keywords` | substring | `CTO`, `Assistant to the CTO`, `CTO/Founder` | You want a family of titles |
+
+Whole-title matching is case-insensitive and collapses runs of whitespace, but
+keeps punctuation — so `C++ Developer` and `C Developer` stay distinct entries.
+The cost is that `VP, Engineering` and `VP Engineering` are two entries, which is
+visible in the file you edit; the alternative, a wrong match, is not.
+
+`required_fields` takes dotted paths resolved against the lead model, so any
+field is addressable without a code change: `company.name`, `person.email`,
+`person.linkedin_url`. Each path is attributed separately in the run report
+(`company.name` → `require_company_name`), so a multi-requirement profile says
+*which* requirement emptied the run. A path that does not exist on the model is a
+**configuration error, not a rule that never fires** — a filter that silently
+keeps everything would produce a clean-looking run you would trust.
+
+Allow-lists and deny-lists treat missing data differently, on purpose: a lead
+with no country fails `include_countries` (it cannot be shown to be inside the
+list) but survives `exclude_countries` (you cannot rule out a country you cannot
+see). The same asymmetry applies to industries and titles.
+
+### Deduplication
+
+Deduplication matches on an **identity ladder**, and that order is fixed:
+
+```
+source_id → email → linkedin → phone_name → name_domain → name_company
+```
+
+1. `source_id` — `provider:external_id`. The source itself says these are one
+   record, so this is proof and it is scoped by provider: two sources using
+   overlapping id spaces is normal, not a duplicate.
+2. `email`, `linkedin` — unique to a person; also proof.
+3. `phone_name`, `name_domain`, `name_company` — inference, confirmed by a name.
+
+Which keys the active strategy may use is what `dedup_strategy` selects:
+
+| Strategy | Keys | Catches |
+| -------- | ---- | ------- |
+| `none` | — | Nothing; keeps every record |
+| `email` | `source_id`, `email` | Same record re-crawled, same address from two sources |
+| `identity` *(default)* | `+ linkedin`, `phone_name` | Someone the second source knows by profile or phone |
+| `aggressive` | `+ name_domain`, `name_company` | A name at a company, with no shared address |
+
+**A bare name is never an identity.** There is no surname-only key, so two
+different people named Smith at one employer do not collapse. Under `aggressive`,
+the same *full* name at the same company domain does match — and is reported as a
+probable duplicate, not a proven one.
+
+That distinction is a first-class field. Every collapse is classified as
+`exact` (matched on `source_id`, email or LinkedIn — proof) or `probable`
+(matched on a name-anchored key — inference), and the run reports all four
+statistics:
+
+| Statistic | Meaning |
+| --------- | ------- |
+| `records_before_deduplication` | Leads that entered the stage |
+| `exact_duplicates` | Collapsed on proof |
+| `probable_duplicates` | Collapsed on inference |
+| `records_after_deduplication` | `before − exact − probable` |
+
+```text
+  before dedup       40
+  duplicates merged  5
+    exact            5
+    probable         0
+  after dedup        35
+```
+
+The split is what tells a reviewer whether a merge is worth checking by hand: a
+non-zero `probable` count means some records were combined because two names
+looked alike, and `--verbose` names each one and the key that linked it.
+
+**Duplicates are merged, not discarded.** With `dedup_merge_fields` on (the
+default), missing fields on the surviving record are filled from the duplicate —
+"prefer non-empty", in its simplest and most predictable form — while the
+first-seen record wins wherever both carry a value. `lead_id` is left untouched,
+so a merged lead keeps a stable id across runs.
+
+Provenance is the exception to "first-seen wins". A `LeadSource` carries a
+`sources` list, and merging unions it:
+
+```json
+"source": { "provider": "apollo", "external_id": "abc", "sources": ["apollo", "company_website"] }
+```
+
+`provider`, `external_id`, `source_url` and `collected_at` stay the primary's —
+they describe that record's own retrieval, and overwriting them would
+misattribute it — but collapsing two records must not erase the fact that a
+second source contributed. The duplicate pairs in the run report name each
+absorbed record's provider, and the CSV export carries `sources` as a
+semicolon-separated column.
+
+Determinism is structural rather than incidental: matches are looked up in the
+fixed ladder order rather than in dictionary order, and a key always resolves to
+the *first* lead that claimed it, so a run over the same input always produces
+the same output.
 
 ---
 
@@ -449,7 +879,7 @@ filters and deduplicator apply unchanged.
 ## Tests
 
 ```bash
-pytest                      # 547 tests
+pytest                      # 714 tests
 pytest tests/test_cli.py -v # one module
 pytest -k dedup             # by name
 
@@ -466,6 +896,18 @@ Coverage is organized by the property each module is responsible for rather than
 by line count: registry extensibility, normalizer/validator edge cases, dedup
 identity ladders, exporter header/format integrity, per-source failure isolation,
 stage accounting, and the CLI exit-code contract.
+
+Two of those properties get stated as tests rather than as prose, because both
+are the kind that would otherwise decay quietly:
+
+- `tests/test_filter_profiles.py` reads the **shipped** `config/filters.yaml`, so
+  the documented example cannot drift into being unloadable without a test
+  noticing, and asserts that naming no profile loads no file.
+- `tests/test_exporters.py` asserts `make_lead().flatten()` matches
+  `LEAD_COLUMNS` exactly, so a new field cannot be added to the model and
+  silently left out of the CSV. It also pins the filename a run writes and the
+  summary keys, and round-trips Vietnamese both composed and decomposed —
+  a mangled export still opens, so only an assertion on the bytes catches it.
 
 ---
 
@@ -494,9 +936,51 @@ Phase 1 is deliberately narrow. What it does **not** do:
 - **A website seed is normalized to `https://<host>`**, dropping any scheme and
   port you typed. That is right for a public company site and wrong for a
   staging box on `http://localhost:8080`, which this source cannot reach.
-- **`aggressive` dedup can over-merge.** It matches on name + company domain,
-  which collapses two genuinely different people who share a name at one
-  employer. `identity` (the default) is the conservative choice.
+- **Email deliverability is never checked.** Normalization validates syntax only
+  and contacts no mailbox — verification is an external service and out of scope
+  for Phase 1. A syntactically perfect address may still bounce.
+- **Query strings are preserved except for known tracking parameters.** Only the
+  narrow list in `src/utils/urls.py` is removed; a parameter that *looks* like
+  tracking but is not on that list (`?ref=`, `?source=`) survives, deliberately,
+  because dropping a real page selector would point a lead at the wrong page.
+  Add to `TRACKING_PARAMS` if a source you use carries a distinct click-id.
+- **`mailto:`, `tel:` and `javascript:` links are rejected as URLs** rather than
+  coerced into a host. A contact page recorded from a site's markup can
+  therefore be empty when the site's only contact link is an email address —
+  correct, since that is not a page, but worth knowing when a site looks like it
+  should have yielded one.
+- **Only one original value is preserved alongside its normalized form.** Job
+  titles keep `job_title_raw` because trimming a trailing employer clause is
+  lossy and the clause is often useful. Other fields keep only the normalized
+  value; the pre-normalization record survives solely in the `raw` payload of a
+  JSON/JSONL export.
+- **`aggressive` dedup can still over-merge.** It matches on full name + company
+  domain, which collapses two genuinely different people who share a full name at
+  one employer (`John Smith` twice at `acme.com`). Surname-only matching was
+  removed precisely because it merged unrelated colleagues, but a shared full
+  name at one company is indistinguishable from a duplicate without a stronger
+  key. Such merges are reported as `probable_duplicates` rather than
+  `exact_duplicates`, so the run tells you how many are worth a look. `identity`
+  (the default) never takes this risk.
+- **Whole-title matching requires you to enumerate the titles.** `include_titles`
+  matches the normalized title exactly, so it will not admit a spelling you did
+  not list — which is the intent, but it means an ICP driven by `allowed_titles`
+  needs the variants (`VP Engineering` *and* `VP, Engineering`) spelled out. The
+  run report's `include_titles` count is the signal that the list is too narrow.
+- **A filter profile replaces the environment's filter rules rather than merging
+  with them.** That is deliberate — it makes a named profile mean the same thing
+  everywhere — but it means introducing `--filter-profile` into a workflow that
+  relied on `LEAD_FILTERS__*` variables silently drops those variables. Flags
+  still override individual rules on top of the profile.
+- **Deduplication is single-key, not scored.** A record matches on the strongest
+  key available to it, so two records linked only by a weak key merge even when a
+  closer look would separate them. There is no confidence threshold below which a
+  match is refused; the `exact`/`probable` split reports the risk rather than
+  preventing it.
+- **Merging cannot arbitrate a disagreement.** Where both records carry a value
+  for the same field, the first-seen one wins — the pipeline has no way to tell
+  which source is more trustworthy. `dedup_merge_fields=false` makes that
+  explicit by refusing to merge at all.
 - **Seniority inference is keyword-based**, not a classifier. Unusual titles fall
   back to `UNKNOWN`; that is a safe default, but a title like "Growth Hacker"
   will not be classified.

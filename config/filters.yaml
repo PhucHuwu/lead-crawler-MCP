@@ -1,0 +1,131 @@
+# Filter (qualification) profiles.
+#
+# A profile is a named, reusable answer to "which leads do we keep?", so an ICP
+# can be reviewed and version-controlled as a file instead of retyped as six
+# flags on every run:
+#
+#     python -m src.main --source mock --filter-profile default
+#     python -m src.main --source mock --filter-profile      # short for `default`
+#     python -m src.main --list-filter-profiles              # what is defined here
+#     python -m src.main --source mock --profile singapore-tech   # this half + search_profiles.yaml
+#
+# `--profile <name>` is the umbrella: it selects the profile of that name from
+# THIS file and from config/search_profiles.yaml at once, so one name describes a
+# whole acquisition strategy. A name defined in only one of the two files is fine
+# and simply applies in one place. `--filter-profile` names this half explicitly
+# and therefore wins over `--profile`.
+#
+# Resolution order, weakest first:
+#
+#     LEAD_FILTERS__* environment values  <  filter profile  <  CLI flags
+#
+# So a profile overrides the generic environment defaults, and an explicit flag on
+# the command line beats both. Point at a different file with
+# LEAD_FILTER_PROFILES_PATH. With no --filter-profile and no LEAD_FILTER_PROFILE,
+# nothing here is loaded and the LEAD_FILTERS__* values apply alone -- this file
+# is inert until a profile is named.
+#
+# Nothing below is a house opinion about Tinasoft's market. These are worked
+# examples of the schema: copy one, rename it, and edit the rules.
+#
+# EVERY KEY IS OPTIONAL, and an omitted key means "do not constrain on this"
+# rather than "match nothing". An empty profile therefore keeps every lead that
+# survives validation.
+#
+# Keys
+#   allowed_titles / blocked_titles
+#                   Job titles to keep / drop. Matched against the WHOLE
+#                   normalized title, case-insensitively: "CTO" admits "CTO" and
+#                   "cto", but not "Assistant to the CTO". For substring matching
+#                   use the --title-keywords CLI flag instead.
+#   allowed_countries / blocked_countries
+#                   ISO codes ("SG") or names ("Singapore"); both are understood.
+#                   A lead with no country fails an allow-list but not a
+#                   deny-list -- you cannot rule out a country you cannot see.
+#   seniority / blocked_seniority
+#                   This project's normalized vocabulary, lowercase:
+#                   founder, c_suite, vp, director, manager, senior, entry,
+#                   intern, unknown.
+#   industries / blocked_industries
+#                   Substring match against the company industry, so "software"
+#                   matches "Software Development".
+#   minimum_employee_count / maximum_employee_count
+#                   Inclusive headcount bounds. When either is set, a lead whose
+#                   company size is unknown is dropped -- it cannot be shown to
+#                   be inside the band.
+#   blocked_domains  Company domains to drop, subdomains included
+#                   ("acme.com" also drops "careers.acme.com").
+#   required_fields  Dotted paths that must carry a value, e.g. company.name.
+#                   Any field on the lead model is addressable; a path that does
+#                   not exist is a configuration error, not a rule that silently
+#                   never fires. Each path is counted separately in the run
+#                   summary, as require_company_name and so on.
+#   exclude_free_email       Drop consumer mailboxes (gmail.com, ...).
+#   exclude_role_based_email Drop shared inboxes (info@, sales@, ...).
+
+default:
+  description: >-
+    Example ICP: decision makers at established companies. Replace with your own
+    rules -- this profile exists to show the schema, not to state a policy.
+  allowed_titles:
+    - CTO
+    - VP Engineering
+    - Head of Engineering
+    - Founder
+  seniority:
+    - founder
+    - c_suite
+    - vp
+  minimum_employee_count: 10
+  maximum_employee_count: 1000
+  required_fields:
+    - company.name
+
+# Companion to the search profile of the same name in search_profiles.yaml. The
+# README quickstart runs both halves at once with `--profile singapore_tech`.
+singapore_tech:
+  description: Singapore engineering leaders at companies big enough to buy, small
+    enough to decide quickly.
+  allowed_countries:
+    - SG
+    - Singapore
+  allowed_titles:
+    - CTO
+    - VP Engineering
+    - Head of Engineering
+    - Head of Platform
+    - Engineering Manager
+  seniority:
+    - c_suite
+    - vp
+    - director
+  minimum_employee_count: 10
+  maximum_employee_count: 5000
+  required_fields:
+    - company.name
+  exclude_role_based_email: true
+
+# A second profile, to show the fuller shape -- geography, deny-lists and email
+# quality. Select with `--filter-profile enterprise_na`.
+enterprise_na:
+  description: Senior contacts at larger North American companies, reachable directly.
+  allowed_countries:
+    - US
+    - CA
+  blocked_countries:
+    - Cuba
+  blocked_titles:
+    - Intern
+    - Assistant
+  seniority:
+    - c_suite
+    - vp
+    - director
+  minimum_employee_count: 200
+  blocked_domains:
+    - example-competitor.com
+  exclude_free_email: true
+  exclude_role_based_email: true
+  required_fields:
+    - company.name
+    - person.email

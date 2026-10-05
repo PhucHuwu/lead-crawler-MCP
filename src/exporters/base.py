@@ -8,6 +8,7 @@ registration.
 
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
@@ -18,10 +19,36 @@ from src.models.enums import ExportFormat
 from src.utils.errors import ConfigError, ExportError
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
     from src.config import Settings
     from src.models.lead import StandardizedLead
+
+#: Anything that is not a lowercase letter or digit is a word separator in a
+#: filename. Kept deliberately narrow: a source name reaches a filesystem here,
+#: and ``/``, ``\``, ``:`` and a leading ``.`` are all meaningful to one platform
+#: or another.
+_SLUG_SEPARATOR_RE = re.compile(r"[^a-z0-9]+")
+
+#: Used when a run's sources are all empty or unusable as a filename component.
+UNKNOWN_SOURCE_SLUG = "unknown"
+
+
+def source_slug(sources: Iterable[str]) -> str:
+    """Filename-safe, deterministic label for the sources a run covered.
+
+    A single source keeps its own name, so a run of ``--source apollo`` writes
+    ``leads_apollo_...``. Several sources are sorted and hyphen-joined, which
+    makes the name independent of the order they were listed on the command line
+    — the same set of sources always produces the same filename, so two runs
+    differ only by timestamp.
+    """
+    slugs: set[str] = set()
+    for name in sources:
+        slug = _SLUG_SEPARATOR_RE.sub("-", name.casefold()).strip("-")
+        if slug:
+            slugs.add(slug)
+    return "-".join(sorted(slugs)) or UNKNOWN_SOURCE_SLUG
 
 
 class ExportResult(BaseModel):
@@ -64,9 +91,14 @@ class BaseExporter(ABC):
             ExportError: if the file cannot be written.
         """
 
-    def build_path(self, directory: Path, prefix: str, timestamp: str) -> Path:
-        """Default destination for this format: ``<prefix>_<timestamp><ext>``."""
-        return directory / f"{prefix}_{timestamp}{self.extension}"
+    def build_path(self, directory: Path, prefix: str, source: str, timestamp: str) -> Path:
+        """Default destination for this format.
+
+        ``<prefix>_<source>_<timestamp><ext>`` — every part is carried by the
+        caller, so all formats written by one run land on the same stem and a
+        reader can tell at a glance which run and which source a file belongs to.
+        """
+        return directory / f"{prefix}_{source}_{timestamp}{self.extension}"
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} format={self.format.value!r}>"

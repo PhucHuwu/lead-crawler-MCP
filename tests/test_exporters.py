@@ -23,9 +23,10 @@ from src.exporters import (
     build_report,
     lead_to_dict,
     registered_exporters,
+    source_slug,
     write_run_report,
 )
-from src.exporters.base import ExportResult, available_formats
+from src.exporters.base import UNKNOWN_SOURCE_SLUG, ExportResult, available_formats
 from src.models.enums import ExportFormat, RejectionReason
 from src.models.results import CrawlResult, CrawlStats, RejectedLead
 from src.utils.errors import ExportError
@@ -77,8 +78,57 @@ class TestCsvExporter:
         assert result.format is ExportFormat.CSV
         assert result.bytes_written == path.stat().st_size
         assert len(rows) == 2
-        assert rows[0]["full_name"] == "Ada Lovelace"
+        assert rows[0]["person_full_name"] == "Ada Lovelace"
         assert rows[0]["company_name"] == "Acme Corp"
+
+    async def test_the_raw_job_title_reaches_its_own_column(
+        self, settings: Settings, tmp_path: Path
+    ) -> None:
+        # Normalization threw away the "at Acme Corp" clause; the export is the
+        # last place that clause can still be seen, so it needs its own column.
+        lead = make_lead(job_title="CTO")
+        lead.person.job_title_raw = "CTO at Acme Corp"
+        path = tmp_path / "titles.csv"
+        await CsvExporter(settings).export([lead, make_lead()], path)
+
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+
+        assert rows[0]["person_job_title"] == "CTO"
+        assert rows[0]["person_job_title_raw"] == "CTO at Acme Corp"
+        # A title the normalizer left alone stays blank rather than duplicating
+        # the column beside it, which keeps the sheet readable.
+        assert rows[1]["person_job_title_raw"] == ""
+
+    async def test_provenance_reaches_its_own_column(
+        self, settings: Settings, tmp_path: Path
+    ) -> None:
+        # After a merge, the export is the only place the contributing sources
+        # are visible as a list; the columns beside it name just the primary.
+        lead = make_lead(provider="apollo")
+        path = tmp_path / "sources.csv"
+        await CsvExporter(settings).export([lead, make_lead()], path)
+
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+
+        assert rows[0]["sources"] == "apollo"
+        assert rows[0]["source_provider"] == "apollo"
+
+    async def test_multiple_sources_are_semicolon_separated(
+        self, settings: Settings, tmp_path: Path
+    ) -> None:
+        # A comma would be read as a column break by every spreadsheet that opens
+        # the file, which is exactly what this column exists to be read from.
+        lead = make_lead(provider="apollo")
+        lead.source.sources.append("company_website")
+        path = tmp_path / "multi-sources.csv"
+        await CsvExporter(settings).export([lead], path)
+
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+
+        assert rows[0]["sources"] == "apollo; company_website"
 
     async def test_empty_result_still_produces_a_usable_header(
         self, settings: Settings, tmp_path: Path
@@ -107,7 +157,7 @@ class TestCsvExporter:
 
         with path.open(encoding="utf-8-sig", newline="") as handle:
             reader = csv.DictReader(handle, delimiter=";")
-            assert next(reader)["full_name"] == "Ada Lovelace"
+            assert next(reader)["person_full_name"] == "Ada Lovelace"
 
     async def test_embedded_delimiters_are_quoted(self, settings: Settings, tmp_path: Path) -> None:
         path = tmp_path / "quoted.csv"
@@ -130,7 +180,7 @@ class TestCsvExporter:
         await CsvExporter(settings).export([lead], path)
         with path.open(encoding="utf-8-sig", newline="") as handle:
             row = next(csv.DictReader(handle))
-        assert row["email"] == "" and row["full_name"] == ""
+        assert row["person_email"] == "" and row["person_full_name"] == ""
         assert row["lead_id"]  # the id is always present
 
     async def test_existing_file_is_replaced_not_appended(
@@ -167,9 +217,13 @@ class TestCsvExporter:
         await CsvExporter(settings).export([make_lead()], path)
         assert path.stat().st_mode & 0o644 == 0o644
 
-    async def test_build_path_uses_the_prefix_and_timestamp(self, settings: Settings) -> None:
-        path = CsvExporter(settings).build_path(Path("out"), "leads", "20260101T000000Z")
-        assert path == Path("out/leads_20260101T000000Z.csv")
+    async def test_build_path_names_the_prefix_source_and_timestamp(
+        self, settings: Settings
+    ) -> None:
+        path = CsvExporter(settings).build_path(
+            Path("out"), "leads", "apollo", "2026-10-05_14-03-22"
+        )
+        assert path == Path("out/leads_apollo_2026-10-05_14-03-22.csv")
 
 
 class TestJsonExporter:
@@ -237,8 +291,124 @@ class TestJsonLinesExporter:
         assert path.read_text(encoding="utf-8") == ""
 
     async def test_build_path_uses_the_jsonl_extension(self, settings: Settings) -> None:
-        path = JsonLinesExporter(settings).build_path(Path("out"), "leads", "T")
+        path = JsonLinesExporter(settings).build_path(Path("out"), "leads", "apollo", "T")
         assert path.suffix == ".jsonl"
+
+
+class TestSourceSlug:
+    """The run's sources become one filename component.
+
+    A name that reaches a filesystem has to be safe there and stable across
+    runs; both properties are cheaper to assert here than to debug as a file
+    someone cannot find.
+    """
+
+    def test_a_single_source_keeps_its_name(self) -> None:
+        assert source_slug(["apollo"]) == "apollo"
+
+    def test_several_sources_are_sorted_so_listing_order_does_not_matter(self) -> None:
+        assert source_slug(["website", "apollo"]) == "apollo-website"
+        assert source_slug(["apollo", "website"]) == source_slug(["website", "apollo"])
+
+    def test_repeats_are_collapsed(self) -> None:
+        assert source_slug(["apollo", "apollo"]) == "apollo"
+
+    def test_a_hostile_name_cannot_introduce_a_path_separator(self) -> None:
+        # Nothing here is expected from a real provider; the point is that the
+        # slug is built by whitelisting rather than by escaping, so no input can
+        # climb out of the output directory or add a second extension.
+        slug = source_slug(["Apollo.io/../../etc/passwd"])
+        assert "/" not in slug and ".." not in slug
+        assert slug == "apollo-io-etc-passwd"
+
+    def test_a_run_with_no_usable_source_name_still_names_a_file(self) -> None:
+        assert source_slug([]) == UNKNOWN_SOURCE_SLUG
+        assert source_slug(["", "///"]) == UNKNOWN_SOURCE_SLUG
+
+
+class TestUnicodePreservation:
+    """Vietnamese and other non-Latin text must survive every writer intact.
+
+    The failure mode here is silent: a mangled export still opens, still parses,
+    and is simply wrong — and it is found by whoever tries to contact the person
+    it misnames. So these assert on bytes as well as on the parsed value.
+    """
+
+    #: Diacritics on both a vowel and a consonant (Nguyễn, Hương), which makes
+    #: this a better probe than an accent-only name.
+    VIETNAMESE = "Nguyễn Thị Hương"
+
+    async def test_csv_round_trips_vietnamese(self, settings: Settings, tmp_path: Path) -> None:
+        path = tmp_path / "leads.csv"
+        await CsvExporter(settings).export([make_lead(full_name=self.VIETNAMESE)], path)
+
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            row = next(csv.DictReader(handle))
+
+        assert row["person_full_name"] == self.VIETNAMESE
+
+    async def test_csv_holds_the_utf8_bytes_themselves(
+        self, settings: Settings, tmp_path: Path
+    ) -> None:
+        # Read as bytes, not text: this is the assertion that fails if the file
+        # were written as latin-1, or with the diacritics folded to ASCII.
+        path = tmp_path / "leads.csv"
+        await CsvExporter(settings).export([make_lead(full_name=self.VIETNAMESE)], path)
+        assert self.VIETNAMESE.encode("utf-8") in path.read_bytes()
+
+    async def test_json_keeps_characters_literal_rather_than_escaped(
+        self, settings: Settings, tmp_path: Path
+    ) -> None:
+        # ``ensure_ascii`` would render this as ễện: still valid JSON,
+        # but no longer readable in an editor or by grep, which is how these
+        # files are actually inspected.
+        path = tmp_path / "leads.json"
+        await JsonExporter(settings).export([make_lead(full_name=self.VIETNAMESE)], path)
+
+        raw = path.read_text(encoding="utf-8")
+        assert self.VIETNAMESE in raw
+        assert "\\u1ec5" not in raw
+        assert json.loads(raw)[0]["person"]["full_name"] == self.VIETNAMESE
+
+    async def test_jsonl_round_trips_vietnamese(self, settings: Settings, tmp_path: Path) -> None:
+        path = tmp_path / "leads.jsonl"
+        await JsonLinesExporter(settings).export([make_lead(full_name=self.VIETNAMESE)], path)
+
+        line = path.read_text(encoding="utf-8").splitlines()[0]
+        assert json.loads(line)["person"]["full_name"] == self.VIETNAMESE
+
+    async def test_scripts_beyond_latin_survive_too(
+        self, settings: Settings, tmp_path: Path
+    ) -> None:
+        # Vietnamese is the stated requirement; this keeps the guarantee from
+        # being accidentally narrowed to one script.
+        company = "東京テクノロジー株式会社"
+        path = tmp_path / "leads.csv"
+        await CsvExporter(settings).export([make_lead(company_name=company)], path)
+
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            row = next(csv.DictReader(handle))
+
+        assert row["company_name"] == company
+
+    async def test_vietnamese_survives_the_run_report(
+        self, settings: Settings, tmp_path: Path
+    ) -> None:
+        # The rejection sample is the one place a lead's own text reaches the
+        # report, so the report needs the same guarantee as the exports.
+        result = CrawlResult(
+            rejections=[
+                RejectedLead(
+                    provider="apollo",
+                    label=self.VIETNAMESE,
+                    reason=RejectionReason.FILTERED_OUT,
+                )
+            ]
+        )
+        path = tmp_path / "report.json"
+        await write_run_report(result, path, settings)
+
+        assert self.VIETNAMESE in path.read_text(encoding="utf-8")
 
 
 class TestExportResult:
@@ -252,7 +422,15 @@ class TestExportResult:
 
 class TestRunReport:
     def build_result(self) -> CrawlResult:
-        stats = CrawlStats(raw_collected=10, normalized=10, filtered_out=2, exported=1)
+        stats = CrawlStats(
+            raw_collected=10,
+            normalized=10,
+            filtered_out=2,
+            exported=1,
+            records_before_deduplication=10,
+            exact_duplicates=2,
+            probable_duplicates=1,
+        )
         stats.per_filter_reason["exclude_free_email"] = 2
         stats.source_errors["apollo"] = "boom"
         stats.finalize()
@@ -276,6 +454,81 @@ class TestRunReport:
         assert report["sources"]["errors"] == {"apollo": "boom"}
         assert report["rejections"]["recorded"] == 1
         assert report["rejections"]["sample"][0]["reason"] == "filtered_out"
+
+    def test_the_summary_states_the_whole_run_in_one_block(self, settings: Settings) -> None:
+        summary = build_report(self.build_result(), settings)["summary"]
+        assert summary["discovered"] == 10
+        assert summary["valid"] == 10
+        assert summary["filtered"] == 2
+        assert summary["duplicates_removed"] == 3
+        assert summary["exported"] == 1
+        assert summary["errors"] == 0
+
+    def test_the_summary_carries_exactly_the_documented_keys(self, settings: Settings) -> None:
+        # A stable, small shape: consumers of the summary should not have to
+        # re-check which keys exist each release.
+        summary = build_report(self.build_result(), settings)["summary"]
+        assert set(summary) == {
+            "source",
+            "started_at",
+            "finished_at",
+            "discovered",
+            "valid",
+            "filtered",
+            "duplicates_removed",
+            "exported",
+            "errors",
+        }
+
+    def test_the_summary_errors_count_records_that_could_not_be_used(
+        self, settings: Settings
+    ) -> None:
+        # Distinct from `sources.errors` below, which counts failed providers:
+        # this is the record-level figure, and the two are never the same number.
+        result = self.build_result()
+        result.stats.validation_failed = 3
+        result.stats.record_validation("require_email")
+        result.stats.finalize()
+        assert build_report(result, settings)["summary"]["errors"] == 3
+
+    def test_the_summary_names_the_requested_sources(self, settings: Settings) -> None:
+        report = build_report(self.build_result(), settings, sources=["apollo", "website"])
+        assert report["summary"]["source"] == "apollo-website"
+
+    def test_the_summary_source_is_the_one_in_the_export_filename(self, settings: Settings) -> None:
+        # The report and the files must agree about which run they describe;
+        # they share one slug so they cannot drift apart.
+        report = build_report(self.build_result(), settings, sources=["apollo"])
+        slug = report["summary"]["source"]
+        path = CsvExporter(settings).build_path(Path("out"), "leads", slug, "2026-10-05_14-03-22")
+        assert path.name == "leads_apollo_2026-10-05_14-03-22.csv"
+
+    def test_a_run_without_a_recorded_source_still_reports_one(self, settings: Settings) -> None:
+        assert build_report(CrawlResult(), settings)["summary"]["source"] == UNKNOWN_SOURCE_SLUG
+
+    def test_the_summary_timestamps_bound_the_run(self, settings: Settings) -> None:
+        summary = build_report(self.build_result(), settings)["summary"]
+        assert summary["started_at"] <= summary["finished_at"]
+
+    def test_reports_all_four_deduplication_statistics(self, settings: Settings) -> None:
+        # `records_after_deduplication` is derived, so it is absent from `stats`
+        # have to know which of the four are stored and which are arithmetic.
+        report = build_report(self.build_result(), settings)
+        assert report["deduplication"] == {
+            "records_before_deduplication": 10,
+            "exact_duplicates": 2,
+            "probable_duplicates": 1,
+            "records_after_deduplication": 7,
+        }
+
+    def test_the_deduplication_statistics_agree_with_each_other(self, settings: Settings) -> None:
+        dedup = build_report(self.build_result(), settings)["deduplication"]
+        assert (
+            dedup["records_before_deduplication"]
+            - dedup["exact_duplicates"]
+            - dedup["probable_duplicates"]
+            == dedup["records_after_deduplication"]
+        )
 
     def test_active_filters_are_echoed(self) -> None:
         configured = load_settings(filters={"require_email": True, "include_countries": ["US"]})

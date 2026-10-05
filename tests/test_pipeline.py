@@ -535,3 +535,118 @@ class TestRunSummaryLog:
         summary = next(r for r in caplog.records if r.getMessage() == "run summary")
         extras = {k: v for k, v in summary.__dict__.items() if k in self.REQUIRED}
         assert json.loads(json.dumps(extras, default=str))["records_discovered"] == 1
+
+
+class TestValidationWarnings:
+    """A record can be kept *and* flagged.
+
+    A lead whose company domain was garbled upstream is still addressable: it has
+    a name, an employer and a mailbox. Dropping it would throw away good data to
+    punish one bad field — so it ships, and the run report says so.
+    """
+
+    @staticmethod
+    def warned(**overrides: Any) -> RawLead:
+        """A lead that survives validation but lost a value on the way in."""
+        defaults: dict[str, Any] = {
+            "external_id": "warned-1",
+            # No fallback exists: a consumer mailbox yields no company domain and
+            # there is no website to derive one from, so the garbled domain is
+            # genuinely lost.
+            "email": "ada@gmail.com",
+            "company_domain": "not a domain",
+        }
+        defaults.update(overrides)
+        return make_raw_lead(**defaults)
+
+    @staticmethod
+    def fatal(**overrides: Any) -> RawLead:
+        """A lead with nothing to identify and no company signal."""
+        defaults: dict[str, Any] = {
+            "external_id": "fatal-1",
+            "first_name": None,
+            "last_name": None,
+            "full_name": "Info",
+            "email": None,
+            "company_name": None,
+            "company_domain": None,
+        }
+        defaults.update(overrides)
+        return make_raw_lead(**defaults)
+
+    async def test_a_warned_record_is_still_exported(self, settings: Settings) -> None:
+        result = await run_pipeline(settings, [FakeCrawler(settings, [self.warned()])])
+
+        assert len(result.leads) == 1
+        assert result.stats.validation_warned == 1
+        assert result.stats.exported == 1
+
+    async def test_a_warning_is_attributed_to_its_rule(self, settings: Settings) -> None:
+        result = await run_pipeline(settings, [FakeCrawler(settings, [self.warned()])])
+
+        assert result.stats.per_validation_reason == {"invalid_domain": 1}
+
+    async def test_a_warning_is_not_a_rejection(self, settings: Settings) -> None:
+        # The counters a run report leads with must not move: nothing was dropped.
+        result = await run_pipeline(settings, [FakeCrawler(settings, [self.warned()])])
+
+        assert result.stats.total_rejected == 0
+        assert result.stats.records_invalid == 0
+        assert result.stats.validation_failed == 0
+        assert result.rejections == []
+
+    async def test_a_clean_record_is_neither_warned_nor_failed(self, settings: Settings) -> None:
+        # The guard against over-reporting: an ordinary lead raises nothing.
+        result = await run_pipeline(settings, [FakeCrawler(settings, [rich_raw()])])
+
+        assert result.stats.validation_warned == 0
+        assert result.stats.per_validation_reason == {}
+
+    async def test_warnings_and_errors_are_counted_separately(self, settings: Settings) -> None:
+        result = await run_pipeline(
+            settings, [FakeCrawler(settings, [self.warned(), self.fatal()])]
+        )
+
+        assert result.stats.validation_warned == 1
+        assert result.stats.validation_failed == 1
+        # Only the fatal record is unusable, so only it is subtracted from the run.
+        assert result.stats.records_invalid == 1
+        assert result.stats.total_rejected == 1
+        assert len(result.leads) == 1
+
+    async def test_a_fatal_rule_is_attributed_too(self, settings: Settings) -> None:
+        # Attribution is about which checks are noisy, not about outcomes, so a
+        # record that dies still names the rule that killed it.
+        result = await run_pipeline(settings, [FakeCrawler(settings, [self.fatal()])])
+
+        assert result.stats.per_validation_reason
+        assert result.stats.validation_warned == 0
+        assert "non_person_name" in result.stats.per_validation_reason
+
+    async def test_the_flag_is_logged_per_record(
+        self, settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The counters give the total; this line is what says *which* lead.
+        with caplog.at_level(logging.DEBUG, logger="src.processors.pipeline"):
+            await run_pipeline(settings, [FakeCrawler(settings, [self.warned()])])
+
+        flagged = [r for r in caplog.records if r.getMessage() == "lead flagged"]
+        assert len(flagged) == 1
+        detail = flagged[0].__dict__["detail"]
+        assert "company_domain" in detail
+        assert "not a domain" in detail
+
+    async def test_the_run_summary_reports_warnings_and_rules(
+        self, settings: Settings, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.INFO, logger="src.processors.pipeline"):
+            await run_pipeline(settings, [FakeCrawler(settings, [self.warned(), self.fatal()])])
+
+        summary = next(r for r in caplog.records if r.getMessage() == "run summary")
+        fields = summary.__dict__
+        assert fields["records_warned"] == 1
+        assert fields["validation_rules"]["invalid_domain"] == 1
+        assert fields["validation_rules"]["non_person_name"] == 1
+        # The summary is emitted as JSON under --log-format json, so the new
+        # mapping must serialize rather than merely exist.
+        assert json.loads(json.dumps(fields["validation_rules"]))

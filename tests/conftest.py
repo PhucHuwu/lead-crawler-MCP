@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from src.config import FilterSettings, Settings, load_settings
+from src.config import FilterSettings, Settings, load_settings, misnamed_env_vars
 from src.models.company import Company
 from src.models.lead import LeadSource, RawLead, StandardizedLead
 from src.models.person import Person
@@ -28,8 +28,14 @@ def _isolate_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     change behaviour mid-suite. The default output directory is also redirected
     into the test's tmp_path.
     """
+    # `misnamed_env_vars` is the other half of the same problem: those names are
+    # not read, but their presence stops a run, so a stray `LOG_LEVEL` or
+    # `APOLLO_API_KEY` in the developer's shell would fail unrelated tests.
+    # Derived from the settings models rather than repeated here, so a new
+    # setting cannot make the suite non-hermetic again.
+    guarded = misnamed_env_vars()
     for key in list(os.environ):
-        if key.startswith("LEAD_"):
+        if key.startswith("LEAD_") or key in guarded:
             monkeypatch.delenv(key, raising=False)
     monkeypatch.chdir(tmp_path)
 
@@ -100,7 +106,7 @@ def make_lead(
     country: str | None = "US",
     industry: str | None = "Software",
     provider: str = "test",
-    external_id: str | None = "ext-1",
+    external_id: str | None = None,
 ) -> StandardizedLead:
     """Build a StandardizedLead directly, bypassing the normalizer.
 

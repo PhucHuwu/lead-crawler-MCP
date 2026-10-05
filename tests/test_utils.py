@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import unicodedata
+from pathlib import Path
+
 import pytest
 
+from src.utils.errors import ConfigError
+from src.utils.names import profile_key
 from src.utils.numbers import parse_employee_count
 from src.utils.text import (
     clean_text,
@@ -20,8 +25,11 @@ from src.utils.urls import (
     is_free_email_domain,
     normalize_domain,
     normalize_linkedin_url,
+    normalize_page_url,
     normalize_website,
+    strip_tracking_params,
 )
+from src.utils.yaml_load import load_yaml_mapping
 
 
 class TestCleanText:
@@ -38,6 +46,25 @@ class TestCleanText:
     def test_applies_nfkc_normalization(self) -> None:
         # Full-width digits fold to ASCII.
         assert clean_text("１２３") == "123"
+
+    def test_vietnamese_text_is_preserved(self) -> None:
+        # The diacritics are the name. Dropping them, or escaping them, is the
+        # failure mode this guards against — "Nguyễn" is not "Nguyen".
+        assert clean_text("Nguyễn Thị Hương") == "Nguyễn Thị Hương"
+
+    def test_decomposed_text_is_composed(self) -> None:
+        # macOS and several APIs hand back NFD: "ễ" as "e" + a combining mark.
+        # Unification matters because otherwise one person is two different
+        # strings — two CSV rows that never group, two JSON values that never
+        # compare equal, and a deduplication key that misses its own twin.
+        decomposed = unicodedata.normalize("NFD", "Nguyễn")
+        assert decomposed != "Nguyễn"  # the input really is decomposed
+        assert clean_text(decomposed) == "Nguyễn"
+
+    def test_combining_marks_are_not_stripped_as_invisible(self) -> None:
+        # ``strip_ignorable`` drops Unicode "C" categories; Vietnamese
+        # diacritics are "Mn" (nonspacing mark) and must survive it.
+        assert clean_text("Hương") == "Hương"
 
     def test_coerces_non_strings(self) -> None:
         assert clean_text(42) == "42"
@@ -223,3 +250,171 @@ class TestUrls:
 
     def test_linkedin_rejects_non_linkedin(self) -> None:
         assert normalize_linkedin_url("https://acme.com/ada") is None
+
+
+class TestTrackingParams:
+    """Campaign parameters are dropped; everything else survives.
+
+    The two failure modes are opposite and both bad: keeping ``utm_source``
+    makes one page look like two, and dropping ``?page_id=`` silently points a
+    lead at the wrong page.
+    """
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "utm_source=li&utm_medium=email&utm_campaign=q3",
+            "fbclid=abc123",
+            "gclid=x&msclkid=y",
+            "mc_cid=1&mc_eid=2",
+            "pk_campaign=newsletter",
+            "_hsenc=abc&_hsmi=def",
+            "hsa_cam=1&hsa_grp=2",
+        ],
+    )
+    def test_tracking_families_are_removed(self, query: str) -> None:
+        assert strip_tracking_params(query) == ""
+
+    @pytest.mark.parametrize(
+        "query",
+        ["page_id=12", "department=sales&page_id=3", "lang=en", "v=abc123"],
+    )
+    def test_meaningful_parameters_survive(self, query: str) -> None:
+        assert strip_tracking_params(query) == query
+
+    @pytest.mark.parametrize("query", ["ref=home", "source=careers", "si=xyz"])
+    def test_ambiguous_parameters_are_kept(self, query: str) -> None:
+        # These are just as often real page selectors as tracking tokens, and a
+        # wrong guess rewrites the URL rather than merely tidying it.
+        assert strip_tracking_params(query) == query
+
+    def test_mixed_query_keeps_only_the_meaningful_part(self) -> None:
+        assert strip_tracking_params("page_id=4&utm_source=x&lang=en") == "page_id=4&lang=en"
+
+    def test_original_order_is_preserved(self) -> None:
+        assert strip_tracking_params("b=2&a=1") == "b=2&a=1"
+
+    def test_repeated_parameters_keep_the_first(self) -> None:
+        # Two values for one key is a malformed URL; picking one makes the
+        # normalized form deterministic instead of order-dependent.
+        assert strip_tracking_params("a=1&a=2") == "a=1"
+
+    @pytest.mark.parametrize("query", ["", "&", "&&"])
+    def test_empty_queries_yield_nothing(self, query: str) -> None:
+        assert strip_tracking_params(query) == ""
+
+
+class TestPageUrls:
+    def test_tracking_parameters_are_stripped(self) -> None:
+        assert (
+            normalize_page_url("https://acme.com/contact?utm_source=li&utm_campaign=q3")
+            == "https://acme.com/contact"
+        )
+
+    def test_meaningful_parameters_are_preserved(self) -> None:
+        assert (
+            normalize_page_url("https://acme.com/contact?department=sales")
+            == "https://acme.com/contact?department=sales"
+        )
+
+    def test_fragment_is_dropped(self) -> None:
+        # A fragment never reaches the server, so it cannot distinguish pages.
+        assert normalize_page_url("https://acme.com/contact#team") == "https://acme.com/contact"
+
+    def test_path_and_query_survive_together(self) -> None:
+        assert (
+            normalize_page_url("http://www.acme.com/about/team?page_id=2#top")
+            == "https://acme.com/about/team?page_id=2"
+        )
+
+    def test_bare_host_is_unchanged(self) -> None:
+        assert normalize_page_url("acme.com/") == "https://acme.com"
+
+    @pytest.mark.parametrize("raw", ["javascript:void(0)", "mailto:a@acme.com", "tel:+1234"])
+    def test_non_http_schemes_are_rejected(self, raw: str) -> None:
+        assert normalize_page_url(raw) is None
+
+
+class TestProfileKey:
+    """Names are typed at a shell and written in YAML, so they are spelled two ways."""
+
+    @pytest.mark.parametrize(
+        "spelling", ["singapore_tech", "singapore-tech", "Singapore Tech", "SINGAPORE_TECH"]
+    )
+    def test_every_spelling_of_a_name_reaches_the_same_key(self, spelling: str) -> None:
+        assert profile_key(spelling) == "singapore_tech"
+
+    def test_surrounding_whitespace_is_ignored(self) -> None:
+        assert profile_key("  sea_fintech\n") == "sea_fintech"
+
+    def test_repeated_separators_collapse(self) -> None:
+        # `sea__fintech` is a typo, not a different profile, and a failed run is
+        # a poor way to learn that.
+        assert profile_key("sea__fintech") == "sea_fintech"
+
+    def test_separators_join_words_but_do_not_invent_them(self) -> None:
+        # `default` is one word: inserting a separator makes a different name and
+        # must not silently resolve to the original.
+        assert profile_key("de-fault") == "de_fault"
+
+
+class TestYamlLoading:
+    """The shared loader behind both profile files.
+
+    Every one of these is a failure mode that would otherwise be silent: a
+    duplicate key would keep the last definition, and a mistyped document would
+    load as "no profiles" rather than as the mistake it is.
+    """
+
+    def _load(self, tmp_path: Path, body: str) -> dict[object, object]:
+        path = tmp_path / "doc.yaml"
+        path.write_text(body, encoding="utf-8")
+        return load_yaml_mapping(path, label="widget profiles", env_var="LEAD_WIDGETS_PATH")
+
+    def test_a_valid_document_loads(self, tmp_path: Path) -> None:
+        assert self._load(tmp_path, "a:\n  x: 1\nb:\n  y: 2\n") == {
+            "a": {"x": 1},
+            "b": {"y": 2},
+        }
+
+    def test_a_duplicate_key_is_rejected(self, tmp_path: Path) -> None:
+        # YAML keeps the last one, so an edited-and-pasted profile would silently
+        # discard half of what its author wrote.
+        with pytest.raises(ConfigError, match="duplicate key 'a'"):
+            self._load(tmp_path, "a:\n  x: 1\na:\n  y: 2\n")
+
+    def test_the_duplicate_error_carries_a_line_number(self, tmp_path: Path) -> None:
+        # The file is not open in front of whoever reads the error.
+        with pytest.raises(ConfigError, match=r"line 3"):
+            self._load(tmp_path, "a:\n  x: 1\na:\n  y: 2\n")
+
+    def test_an_unhashable_key_is_reported_rather_than_crashing(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="not usable as a name"):
+            self._load(tmp_path, "? [a, b]\n: 1\n")
+
+    def test_a_missing_file_names_the_setting_and_the_path(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError) as excinfo:
+            load_yaml_mapping(
+                tmp_path / "absent.yaml", label="widget profiles", env_var="LEAD_WIDGETS_PATH"
+            )
+        message = str(excinfo.value)
+        assert "widget profiles file not found" in message
+        assert "LEAD_WIDGETS_PATH" in message
+
+    def test_invalid_yaml_is_reported_with_a_location(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="not valid YAML"):
+            self._load(tmp_path, "a: [unclosed\n")
+
+    def test_an_empty_document_is_reported(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="contains no widget profiles"):
+            self._load(tmp_path, "")
+
+    def test_a_comment_only_document_is_reported(self, tmp_path: Path) -> None:
+        # YAML reads this as `None`, which must not be mistaken for a document
+        # that happens to define nothing.
+        with pytest.raises(ConfigError, match="contains no widget profiles"):
+            self._load(tmp_path, "# nothing but a note\n")
+
+    def test_a_non_mapping_document_names_what_it_got_instead(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="must be a mapping of names to settings, got list"):
+            self._load(tmp_path, "- a\n- b\n")

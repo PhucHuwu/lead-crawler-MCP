@@ -16,23 +16,33 @@ from typing import TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.models.enums import DedupStrategy, SeniorityLevel
-from src.models.lead import StandardizedLead
+from src.models.enums import DedupStrategy, DuplicateKind
+from src.models.lead import LeadSource, StandardizedLead, is_empty_value
 
 #: Identity keys each strategy is allowed to match on, strongest first.
+#:
+#: ``source_id`` heads every non-``NONE`` strategy, including ``EMAIL``. It is
+#: not a judgement call: two records from one provider carrying the same external
+#: id *are* one record, so collapsing them cannot merge two different people even
+#: under the most conservative setting.
 _STRATEGY_KEYS: dict[DedupStrategy, tuple[str, ...]] = {
     DedupStrategy.NONE: (),
-    DedupStrategy.EMAIL: ("email",),
-    DedupStrategy.IDENTITY: ("email", "linkedin", "phone_name"),
+    DedupStrategy.EMAIL: ("source_id", "email"),
+    DedupStrategy.IDENTITY: ("source_id", "email", "linkedin", "phone_name"),
     DedupStrategy.AGGRESSIVE: (
+        "source_id",
         "email",
         "linkedin",
         "phone_name",
         "name_domain",
         "name_company",
-        "lastname_domain",
     ),
 }
+
+#: Which keys constitute proof rather than inference. See :class:`DuplicateKind`.
+#: Everything not listed here is treated as probable, so a key added to the
+#: ladder later defaults to the honest answer rather than the flattering one.
+_EXACT_KEYS: frozenset[str] = frozenset({"source_id", "email", "linkedin"})
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
 
@@ -47,6 +57,13 @@ class DuplicatePair(BaseModel):
     label: str
     matched_key: str
     matched_value: str
+    #: Whether the match is proof or inference.
+    kind: DuplicateKind
+    #: Provider the absorbed record came from. Recorded because the merge keeps
+    #: only the primary's ``external_id``/``source_url``, so without this the
+    #: fact that a second source contributed would live only in
+    #: ``LeadSource.sources`` — with no way to tell which record it was.
+    duplicate_provider: str
 
 
 class DedupOutcome(BaseModel):
@@ -56,10 +73,24 @@ class DedupOutcome(BaseModel):
 
     kept: list[StandardizedLead] = Field(default_factory=list)
     duplicates: list[DuplicatePair] = Field(default_factory=list)
+    #: Leads that entered this pass, before anything was collapsed. Stored rather
+    #: than recomputed so the "before" figure in a report is a measurement, not
+    #: arithmetic that has to stay in step with the other stage counters.
+    considered: int = 0
 
     @property
     def removed_count(self) -> int:
         return len(self.duplicates)
+
+    @property
+    def exact_count(self) -> int:
+        """Duplicates collapsed on proof (same source id, email or LinkedIn)."""
+        return sum(1 for pair in self.duplicates if pair.kind is DuplicateKind.EXACT)
+
+    @property
+    def probable_count(self) -> int:
+        """Duplicates collapsed on inference (name-anchored matches)."""
+        return sum(1 for pair in self.duplicates if pair.kind is DuplicateKind.PROBABLE)
 
 
 class Deduplicator:
@@ -76,9 +107,15 @@ class Deduplicator:
         The first occurrence of an identity is the record that is kept; later
         occurrences are merged into it. Order stability means a run over the same
         input always produces the same output.
+
+        Determinism rests on two things: matches are looked up in the fixed
+        ladder order rather than in dictionary order, and ``index`` uses
+        ``setdefault`` so a key always resolves to the *first* lead that claimed
+        it. Both are what make the result independent of how the input was
+        ordered beyond first-seen precedence.
         """
         if not self._allowed_keys:
-            return DedupOutcome(kept=list(leads))
+            return DedupOutcome(kept=list(leads), considered=len(leads))
 
         kept: list[StandardizedLead] = []
         # (key_name, key_value) -> position in `kept`
@@ -105,6 +142,10 @@ class Deduplicator:
                     label=lead.person.full_name or lead.person.email or lead.lead_id,
                     matched_key=matched_key[0],
                     matched_value=matched_key[1],
+                    kind=DuplicateKind.EXACT
+                    if matched_key[0] in _EXACT_KEYS
+                    else DuplicateKind.PROBABLE,
+                    duplicate_provider=lead.source.provider,
                 )
             )
 
@@ -115,7 +156,7 @@ class Deduplicator:
                 # before, so the index is refreshed to keep later matches working.
                 self._index(self._keys_for(merged), match, index)
 
-        return DedupOutcome(kept=kept, duplicates=duplicates)
+        return DedupOutcome(kept=kept, duplicates=duplicates, considered=len(leads))
 
     # ------------------------------------------------------------------ #
     # Internals
@@ -147,34 +188,51 @@ class Deduplicator:
             index.setdefault(key, position)
 
 
-def _is_missing(value: object) -> bool:
-    """Whether a field carries no information and may be filled by a duplicate."""
-    # Enums must be checked before `str`: SeniorityLevel is a StrEnum, so its
-    # members satisfy `isinstance(value, str)` and would otherwise be judged on
-    # their text ("unknown" is non-empty, and so looks like real data).
-    if isinstance(value, SeniorityLevel):
-        return value is SeniorityLevel.UNKNOWN
-    if value is None:
-        return True
-    if isinstance(value, str):
-        return not value.strip()
-    return False
-
-
 def merge_leads(primary: StandardizedLead, secondary: StandardizedLead) -> StandardizedLead:
-    """Fill gaps in ``primary`` from ``secondary``.
+    """Fill gaps in ``primary`` from ``secondary``, keeping both provenances.
 
     Only *missing* fields are taken, so the first-seen record always wins where
-    both have a value. ``lead_id`` and ``source`` are deliberately left untouched:
-    the merged lead stays the same entity, with the same provenance, and its id
-    remains stable across runs.
+    both have a value — "prefer non-empty" in its simplest and most predictable
+    form. ``lead_id`` is left untouched: the merged lead stays the same entity,
+    so its id stays stable across runs.
+
+    Provenance is the exception to "primary wins". ``source.provider`` stays the
+    primary's, but ``source.sources`` becomes the union, because collapsing two
+    records must not erase the fact that a second source contributed — that is
+    the one piece of information the merge would otherwise destroy.
     """
     merged_person = _merge_entity(primary.person, secondary.person)
     merged_company = _merge_entity(primary.company, secondary.company)
+    merged_source = _merge_sources(primary.source, secondary.source)
 
-    if merged_person is primary.person and merged_company is primary.company:
+    updates: dict[str, object] = {}
+    if merged_person is not primary.person:
+        updates["person"] = merged_person
+    if merged_company is not primary.company:
+        updates["company"] = merged_company
+    if merged_source is not primary.source:
+        updates["source"] = merged_source
+
+    return primary.model_copy(update=updates) if updates else primary
+
+
+def _merge_sources(primary: LeadSource, secondary: LeadSource) -> LeadSource:
+    """Union the two provenance lists, primary's order first.
+
+    ``external_id``, ``source_url`` and ``collected_at`` are deliberately *not*
+    merged: they describe the primary's own retrieval, and overwriting them with
+    another source's values would silently misattribute the record. The second
+    source survives in ``sources``, and in the run report's duplicate pairs.
+    """
+    combined = list(primary.sources)
+    for provider in secondary.sources:
+        if provider not in combined:
+            combined.append(provider)
+    # The model's validator would re-seed the provider anyway; comparing first
+    # avoids a pointless copy when nothing was added.
+    if combined == primary.sources:
         return primary
-    return primary.model_copy(update={"person": merged_person, "company": merged_company})
+    return primary.model_copy(update={"sources": combined})
 
 
 def _merge_entity(target: _ModelT, source: _ModelT) -> _ModelT:
@@ -182,7 +240,7 @@ def _merge_entity(target: _ModelT, source: _ModelT) -> _ModelT:
     updates = {
         name: source_value
         for name in type(target).model_fields
-        if _is_missing(getattr(target, name))
-        and not _is_missing(source_value := getattr(source, name))
+        if is_empty_value(getattr(target, name))
+        and not is_empty_value(source_value := getattr(source, name))
     }
     return target.model_copy(update=updates) if updates else target

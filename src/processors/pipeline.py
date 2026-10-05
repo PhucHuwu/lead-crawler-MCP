@@ -88,17 +88,25 @@ class Pipeline:
         processed = self._process(raw_leads, stats=stats, rejections=rejections)
 
         outcome = self.deduplicator.deduplicate(processed)
-        stats.duplicates_removed = outcome.removed_count
+        stats.records_before_deduplication = outcome.considered
+        stats.exact_duplicates = outcome.exact_count
+        stats.probable_duplicates = outcome.probable_count
         kept = outcome.kept
 
         for pair in outcome.duplicates:
             self._record_rejection(
                 rejections,
                 RejectedLead(
-                    provider="<merged>",
+                    # Named after the absorbed record's source, not the one it was
+                    # merged into: the rejection is about the record that went
+                    # away, and "<merged>" hid which source it came from.
+                    provider=pair.duplicate_provider,
                     label=pair.label,
                     reason=RejectionReason.DUPLICATE,
-                    detail=f"merged into {pair.kept_lead_id} on {pair.matched_key}",
+                    detail=(
+                        f"{pair.kind.value} duplicate: merged into {pair.kept_lead_id} "
+                        f"on {pair.matched_key}"
+                    ),
                 ),
             )
 
@@ -252,6 +260,13 @@ class Pipeline:
     ) -> bool:
         """Validate and filter one normalized lead. True when it should be kept."""
         outcome = self.validator.validate(lead)
+
+        # Attribute every rule that fired, whether or not it was fatal, so the
+        # run report says which checks are noisy rather than only how many
+        # records died.
+        for rule in outcome.rules:
+            stats.record_validation(rule)
+
         if not outcome.is_valid:
             stats.validation_failed += 1
             self._record_rejection(
@@ -265,6 +280,20 @@ class Pipeline:
                 ),
             )
             return False
+
+        if outcome.has_warnings:
+            # "Reject or mark": the record is usable, so it is kept and flagged.
+            # The flag reaches the operator through the run summary counters and
+            # this DEBUG line, which --verbose turns on.
+            stats.validation_warned += 1
+            logger.debug(
+                "lead flagged",
+                extra={
+                    "provider": lead.source.provider,
+                    "label": raw.label(),
+                    "detail": outcome.summary(),
+                },
+            )
 
         decision = self.lead_filter.evaluate(lead)
         if not decision.passed:
@@ -305,9 +334,19 @@ class Pipeline:
                 "records_discovered": stats.raw_collected,
                 "records_parsed": stats.normalized,
                 "records_invalid": stats.records_invalid,
+                "records_warned": stats.validation_warned,
                 "records_filtered": stats.filtered_out,
+                # The dedup block, under the names the run report uses. Before and
+                # after bracket the stage; the two duplicate counts say how much
+                # of the collapse was proof versus inference.
+                "records_before_deduplication": stats.records_before_deduplication,
+                "exact_duplicates": stats.exact_duplicates,
+                "probable_duplicates": stats.probable_duplicates,
+                "records_after_deduplication": stats.records_after_deduplication,
                 "duplicates_removed": stats.duplicates_removed,
                 "records_exported": stats.exported,
+                "validation_rules": stats.per_validation_reason,
+                "filter_rules": stats.per_filter_reason,
                 "errors": stats.source_errors or {},
                 "duration_seconds": stats.duration_seconds,
             },

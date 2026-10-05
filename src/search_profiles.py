@@ -14,17 +14,21 @@ keeps a source-specific vocabulary from leaking into shared configuration.
 Resolution order, weakest first::
 
     LEAD_APOLLO__* environment values  <  search profile  <  CLI flags
+
+This is one half of a strategy; :mod:`src.profiles` resolves ``--profile NAME``
+across this file and the filter profiles file at once.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from src.utils.errors import ConfigError
+from src.utils.names import profile_key
 from src.utils.numbers import parse_employee_range
+from src.utils.yaml_load import load_yaml_mapping
 
 #: Profile used by a bare ``--search-profile`` with no name.
 DEFAULT_PROFILE_NAME = "default"
@@ -148,44 +152,37 @@ def load_search_profiles(path: str | Path | None = None) -> dict[str, SearchProf
         path: File to read. ``None`` uses :data:`DEFAULT_PROFILES_PATH`.
 
     Returns:
-        Profile name -> profile. Names are casefolded so lookup is forgiving.
+        Profile name -> profile. Names are normalized (:func:`~src.utils.names.profile_key`)
+        so lookup forgives case and separators.
 
     Raises:
         ConfigError: if the file is missing, is not valid YAML, is not a mapping
-            of names to profiles, or contains a profile that fails validation.
+            of names to profiles, contains a profile that fails validation, or
+            defines two names that differ only in punctuation.
     """
     resolved = Path(path) if path is not None else DEFAULT_PROFILES_PATH
-
-    try:
-        text = resolved.read_text(encoding="utf-8")
-    except FileNotFoundError as exc:
-        raise ConfigError(
-            f"search profiles file not found: {resolved} "
-            f"(set LEAD_SEARCH_PROFILES_PATH or create the file)"
-        ) from exc
-    except OSError as exc:
-        raise ConfigError(f"cannot read search profiles file {resolved}: {exc}") from exc
-
-    try:
-        document = yaml.safe_load(text)
-    except yaml.YAMLError as exc:
-        raise ConfigError(f"{resolved} is not valid YAML: {exc}") from exc
-
-    if document is None:
-        raise ConfigError(f"{resolved} contains no profiles")
-    if not isinstance(document, dict):
-        raise ConfigError(
-            f"{resolved} must be a mapping of profile names to settings, "
-            f"got {type(document).__name__}"
-        )
+    document = load_yaml_mapping(
+        resolved, label="search profiles", env_var="LEAD_SEARCH_PROFILES_PATH"
+    )
 
     profiles: dict[str, SearchProfile] = {}
+    spellings: dict[str, str] = {}
     for raw_name, raw_profile in document.items():
         name = str(raw_name).strip()
         if not name:
             raise ConfigError(f"{resolved} has a profile with an empty name")
+        key = profile_key(name)
+        if key in spellings:
+            # `singapore_tech` and `singapore-tech` are the same key, so the
+            # second would silently replace the first — the exact failure this
+            # module exists to prevent in the other direction.
+            raise ConfigError(
+                f"{resolved} defines both {spellings[key]!r} and {name!r}, which "
+                f"differ only in punctuation; rename one of them"
+            )
+        spellings[key] = name
         try:
-            profiles[name.casefold()] = SearchProfile.model_validate(raw_profile or {})
+            profiles[key] = SearchProfile.model_validate(raw_profile or {})
         except ValidationError as exc:
             raise ConfigError(f"profile {name!r} in {resolved} is invalid: {_format(exc)}") from exc
     return profiles
@@ -208,7 +205,7 @@ def get_search_profile(name: str | None, *, path: str | Path | None = None) -> S
         return None
 
     profiles = load_search_profiles(path)
-    key = name.strip().casefold()
+    key = profile_key(name)
     if key not in profiles:
         known = ", ".join(sorted(profiles)) or "<none>"
         raise ConfigError(f"unknown search profile {name!r}; available profiles: {known}")

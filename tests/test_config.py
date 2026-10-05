@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from src.config import FilterSettings, Settings, load_settings
+from src.config import FilterSettings, Settings, load_settings, misnamed_env_vars
 from src.models.enums import DedupStrategy, ExportFormat, LogFormat, SeniorityLevel
 from src.utils.errors import ConfigError
 
@@ -146,6 +146,134 @@ class TestEnvFile:
         settings = load_settings(env_file=env_file)
         assert settings.log_level == "WARNING"
         assert settings.default_limit == 42
+
+
+class TestMisnamedEnvironmentVariables:
+    """A setting that is silently not read is worse than one that is missing.
+
+    ``env_prefix="LEAD_"`` means a bare ``APOLLO_API_KEY`` is accepted and then
+    ignored, so the run proceeds unauthenticated — and for a credential the
+    difference between "ignored" and "absent" is invisible until it costs
+    something. These tests pin the loud refusal.
+    """
+
+    def test_a_bare_credential_stops_the_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("APOLLO_API_KEY", "sk-live-xxx")
+        with pytest.raises(ConfigError) as excinfo:
+            load_settings()
+        message = str(excinfo.value)
+        # Both halves matter: what is wrong, and what to write instead.
+        assert "APOLLO_API_KEY" in message
+        assert "LEAD_APOLLO__API_KEY" in message
+
+    def test_a_bare_tuning_value_stops_the_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+        with pytest.raises(ConfigError, match="LEAD_LOG_LEVEL"):
+            load_settings()
+
+    def test_the_single_underscore_nested_form_is_caught(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The likeliest typo of all: one underscore instead of the two that mark
+        # a nested field.
+        monkeypatch.setenv("LEAD_FILTERS_MIN_EMPLOYEES", "50")
+        with pytest.raises(ConfigError, match="LEAD_FILTERS__MIN_EMPLOYEES"):
+            load_settings()
+
+    def test_every_offender_is_named_at_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Learning them one per run is a miserable way to be told.
+        monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+        monkeypatch.setenv("APOLLO_API_KEY", "sk-live-xxx")
+        with pytest.raises(ConfigError) as excinfo:
+            load_settings()
+        message = str(excinfo.value)
+        assert "LOG_LEVEL" in message
+        assert "APOLLO_API_KEY" in message
+
+    def test_the_canonical_name_alone_is_read_normally(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LEAD_APOLLO__API_KEY", "sk-live-xxx")
+        assert load_settings().apollo.is_configured is True
+
+    def test_the_wrong_name_is_tolerated_when_the_right_one_is_also_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The tool is reading the right variable, so a stray one is somebody
+        # else's business — failing here would break runs that work correctly.
+        monkeypatch.setenv("APOLLO_API_KEY", "sk-live-wrong")
+        monkeypatch.setenv("LEAD_APOLLO__API_KEY", "sk-live-right")
+        assert load_settings().apollo.is_configured is True
+
+    def test_a_name_belonging_to_another_tool_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The guard has to be worth its false positives. `AWS_PROFILE` and
+        # friends are common in a shell and are not our business.
+        monkeypatch.setenv("AWS_PROFILE", "prod")
+        monkeypatch.setenv("HTTP_PROXY", "http://proxy.internal:3128")
+        assert load_settings().log_level == "INFO"
+
+    def test_a_misnamed_variable_in_the_dotenv_file_is_caught(self, tmp_path: Path) -> None:
+        # The .env file is scanned too, because that is where a credential is
+        # most likely to have been copied in from a provider's docs.
+        env_file = tmp_path / "custom.env"
+        env_file.write_text("APOLLO_API_KEY=sk-live-xxx\n")
+        with pytest.raises(ConfigError, match="LEAD_APOLLO__API_KEY"):
+            load_settings(env_file=env_file)
+
+    def test_the_message_says_the_offender_came_from_the_dotenv_file(self, tmp_path: Path) -> None:
+        env_file = tmp_path / "custom.env"
+        env_file.write_text("APOLLO_API_KEY=sk-live-xxx\n")
+        with pytest.raises(ConfigError, match="custom.env"):
+            load_settings(env_file=env_file)
+
+    def test_a_canonical_dotenv_value_excuses_the_bare_environment_one(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("APOLLO_API_KEY", "sk-live-wrong")
+        env_file = tmp_path / "custom.env"
+        env_file.write_text("LEAD_APOLLO__API_KEY=sk-live-right\n")
+        assert load_settings(env_file=env_file).apollo.is_configured is True
+
+    def test_the_umbrella_profile_name_is_covered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("PROFILE", "singapore_tech")
+        assert load_settings().profile is None  # not read...
+        monkeypatch.setenv("LEAD_PROFILE", "singapore_tech")
+        assert load_settings().profile == "singapore_tech"  # ...but this is
+
+    def test_the_guard_table_is_derived_from_the_settings_models(self) -> None:
+        # Deriving it is what keeps a newly added nested setting covered; an
+        # empty or hand-written-only table would rot without anything noticing.
+        names = misnamed_env_vars()
+        assert names["LEAD_APOLLO_API_KEY"] == "LEAD_APOLLO__API_KEY"
+        assert names["LEAD_FILTERS_MIN_EMPLOYEES"] == "LEAD_FILTERS__MIN_EMPLOYEES"
+        assert names["APOLLO_API_KEY"] == "LEAD_APOLLO__API_KEY"
+
+
+class TestProfileSelection:
+    def test_no_profile_is_selected_by_default(self) -> None:
+        # The whole profile layer must be inert until asked for: with no name,
+        # neither file is even opened.
+        settings = load_settings()
+        assert settings.profile is None
+        assert settings.search_profile is None
+        assert settings.filter_profile is None
+
+    def test_the_umbrella_profile_comes_from_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LEAD_PROFILE", "singapore_tech")
+        assert load_settings().profile == "singapore_tech"
+
+    def test_the_profile_paths_have_shipped_defaults(self) -> None:
+        settings = load_settings()
+        assert settings.search_profiles_path == Path("config/search_profiles.yaml")
+        assert settings.filter_profiles_path == Path("config/filters.yaml")
+
+    def test_the_paths_are_configurable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LEAD_FILTER_PROFILES_PATH", "/etc/leads/filters.yaml")
+        assert load_settings().filter_profiles_path == Path("/etc/leads/filters.yaml")
 
 
 class TestFilterSettings:

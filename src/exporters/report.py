@@ -12,25 +12,54 @@ import asyncio
 import json
 from typing import TYPE_CHECKING, Any
 
+from src.exporters.base import source_slug
 from src.models.results import CrawlResult
 from src.utils.errors import ExportError
 from src.utils.io import atomic_write
 from src.utils.time import to_iso
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
 
     from src.config import Settings
 
 
-def build_report(result: CrawlResult, settings: Settings) -> dict[str, Any]:
+def build_report(
+    result: CrawlResult, settings: Settings, *, sources: Sequence[str] | None = None
+) -> dict[str, Any]:
     """Assemble the report payload.
 
     Deliberately excludes credentials: only non-secret run parameters are echoed,
     so the report is safe to attach to a ticket.
+
+    ``sources`` names the providers the run requested; it is what the summary's
+    ``source`` field and the export filenames are both built from, so a report
+    always names the files it belongs to. Omitted, the requested set is inferred
+    from the counters — which loses a source that failed before returning
+    anything, hence the argument.
     """
     stats = result.stats
+    names = (
+        list(sources)
+        if sources is not None
+        else sorted(set(stats.per_provider) | set(stats.source_errors))
+    )
     return {
+        # A flat digest, first, for the question actually being asked of a report
+        # — "did this run work?" — without making the reader walk the nested
+        # blocks below to answer it.
+        "summary": {
+            "source": source_slug(names),
+            "started_at": to_iso(stats.started_at),
+            "finished_at": to_iso(stats.finished_at),
+            "discovered": stats.raw_collected,
+            "valid": stats.normalized,
+            "filtered": stats.filtered_out,
+            "duplicates_removed": stats.duplicates_removed,
+            "exported": stats.exported,
+            "errors": stats.records_invalid,
+        },
         "generated_at": to_iso(stats.finished_at),
         "run": {
             "started_at": to_iso(stats.started_at),
@@ -42,6 +71,17 @@ def build_report(result: CrawlResult, settings: Settings) -> dict[str, Any]:
             "filters": settings.filters.model_dump(mode="json"),
         },
         "stats": stats.model_dump(mode="json"),
+        # The four deduplication statistics, stated together and under their own
+        # names. Two of them are derived on CrawlStats — a printed total that
+        # could disagree with the split beside it would be worse than no total —
+        # so `stats` above carries only the stored fields. This block is the
+        # complete set, so a consumer does not have to re-derive the arithmetic.
+        "deduplication": {
+            "records_before_deduplication": stats.records_before_deduplication,
+            "exact_duplicates": stats.exact_duplicates,
+            "probable_duplicates": stats.probable_duplicates,
+            "records_after_deduplication": stats.records_after_deduplication,
+        },
         "sources": {
             "collected": stats.per_provider,
             "errors": stats.source_errors,
@@ -58,14 +98,19 @@ def build_report(result: CrawlResult, settings: Settings) -> dict[str, Any]:
 
 
 async def write_run_report(
-    result: CrawlResult, path: Path, settings: Settings, *, limit: int | None = None
+    result: CrawlResult,
+    path: Path,
+    settings: Settings,
+    *,
+    limit: int | None = None,
+    sources: Sequence[str] | None = None,
 ) -> Path:
     """Write the run report atomically.
 
     Raises:
         ExportError: if the report cannot be written.
     """
-    report = build_report(result, settings)
+    report = build_report(result, settings, sources=sources)
     if limit is not None:
         report["run"]["limit_per_source"] = limit
 

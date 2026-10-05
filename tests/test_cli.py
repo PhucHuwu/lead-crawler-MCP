@@ -11,13 +11,15 @@ import json
 import logging
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
+from src.config import FilterSettings
 from src.crawlers import registry as registry_module
 from src.crawlers.base import BaseCrawler
 from src.crawlers.registry import register_crawler
+from src.filter_profiles import DEFAULT_PROFILE_NAME
 from src.main import (
     EXIT_ALL_SOURCES_FAILED,
     EXIT_CONFIG,
@@ -31,6 +33,9 @@ from src.main import (
 from src.models.lead import RawLead
 from src.utils.errors import CrawlerError
 from src.utils.logging import configure_logging
+
+if TYPE_CHECKING:
+    from src.config import Settings
 
 
 @pytest.fixture(autouse=True)
@@ -218,6 +223,328 @@ class TestSourceFlags:
         assert "--website-url" in capsys.readouterr().err
 
 
+class TestFilterProfiles:
+    """The named-profile layer: inert until named, then a complete rule set."""
+
+    #: The example shipped in the repository, by absolute path — the isolation
+    #: fixture chdirs into a tmp_path, so the relative default would not resolve.
+    SHIPPED = Path(__file__).resolve().parents[1] / "config" / "filters.yaml"
+
+    @staticmethod
+    def settings_for(argv: list[str]) -> Settings:
+        return build_settings(build_parser().parse_args(argv))
+
+    @staticmethod
+    def write_profile(tmp_path: Path, body: str) -> Path:
+        path = tmp_path / "filters.yaml"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_bare_filter_profile_means_default(self) -> None:
+        settings = self.settings_for(
+            ["--filter-profile", "--filter-profiles-path", str(self.SHIPPED)]
+        )
+        assert settings.filter_profile == DEFAULT_PROFILE_NAME
+        # Naming a profile resolves it eagerly, so a typo fails before a crawl.
+        assert settings.filters.include_titles == [
+            "CTO",
+            "VP Engineering",
+            "Head of Engineering",
+            "Founder",
+        ]
+
+    def test_filter_profile_takes_a_name(self) -> None:
+        settings = self.settings_for(
+            ["--filter-profile", "enterprise_na", "--filter-profiles-path", str(self.SHIPPED)]
+        )
+        assert settings.filter_profile == "enterprise_na"
+        assert settings.filters.include_countries == ["US", "CA"]
+
+    def test_no_filter_profile_leaves_it_unset(self) -> None:
+        assert self.settings_for([]).filter_profile is None
+
+    def test_no_profile_reads_no_file(self) -> None:
+        # Inert by default: a path pointing nowhere must not break a run that
+        # never asked for a profile. This is what makes the feature safe to ship.
+        settings = self.settings_for(["--filter-profiles-path", "does/not/exist.yaml"])
+        assert settings.filter_profiles_path == Path("does/not/exist.yaml")
+        assert settings.filters == FilterSettings()
+
+    def test_no_profile_keeps_the_environment_rules(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("LEAD_FILTERS__MIN_EMPLOYEES", "42")
+        assert self.settings_for([]).filters.min_employees == 42
+
+    def test_a_profile_replaces_the_environment_rules(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # A profile is a complete statement of which leads we keep, so it must
+        # mean the same thing on every machine rather than merging with whatever
+        # happened to be exported in the shell.
+        monkeypatch.setenv("LEAD_FILTERS__MIN_EMPLOYEES", "42")
+        path = self.write_profile(tmp_path, "default:\n  minimum_employee_count: 10\n")
+        settings = self.settings_for(["--filter-profile", "--filter-profiles-path", str(path)])
+        assert settings.filters.min_employees == 10
+
+    def test_a_flag_overrides_the_profile(self, tmp_path: Path) -> None:
+        path = self.write_profile(
+            tmp_path,
+            "default:\n  minimum_employee_count: 10\n  maximum_employee_count: 1000\n",
+        )
+        settings = self.settings_for(
+            ["--filter-profile", "--filter-profiles-path", str(path), "--min-employees", "5"]
+        )
+        assert settings.filters.min_employees == 5
+        # Overriding one rule must not discard the rest of the profile.
+        assert settings.filters.max_employees == 1000
+
+    def test_an_unknown_profile_is_a_config_error(self, capsys: pytest.CaptureFixture[str]) -> None:
+        code = cli(
+            [
+                "--source",
+                "mock",
+                "--filter-profile",
+                "nope",
+                "--filter-profiles-path",
+                str(self.SHIPPED),
+                "--dry-run",
+            ]
+        )
+        assert code == EXIT_CONFIG
+        assert "unknown filter profile" in capsys.readouterr().err
+
+    def test_a_broken_profile_is_a_config_error(self, tmp_path: Path) -> None:
+        path = self.write_profile(tmp_path, "default:\n  required_fields: [company.nmae]\n")
+        assert (
+            cli(["--source", "mock", "--filter-profile", "--filter-profiles-path", str(path)])
+            == EXIT_CONFIG
+        )
+
+    def test_list_filter_profiles(self, capsys: pytest.CaptureFixture[str]) -> None:
+        shipped = Path(__file__).resolve().parents[1] / "config" / "filters.yaml"
+        assert cli(["--list-filter-profiles", "--filter-profiles-path", str(shipped)]) == EXIT_OK
+        out = capsys.readouterr().out
+        assert DEFAULT_PROFILE_NAME in out
+        assert "enterprise_na" in out
+
+    def test_listing_uses_the_environment_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The listing must name the file a run would actually read, not a default
+        # the user has already overridden.
+        path = self.write_profile(tmp_path, "custom:\n  allowed_titles: [CTO]\n")
+        monkeypatch.setenv("LEAD_FILTER_PROFILES_PATH", str(path))
+        assert cli(["--list-filter-profiles"]) == EXIT_OK
+        assert "custom" in capsys.readouterr().out
+
+
+class TestProfileDrivenRun:
+    """A profile must reach the pipeline, not just the settings object."""
+
+    def test_a_profile_written_to_disk_filters_the_run(
+        self, csv_with_one_email_less_row: Path, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "filters.yaml"
+        path.write_text("default:\n  required_fields: [person.email]\n", encoding="utf-8")
+        code = cli(
+            [
+                "--source",
+                "csv",
+                "--csv-path",
+                str(csv_with_one_email_less_row),
+                "--output-dir",
+                str(tmp_path),
+                "--format",
+                "csv",
+                "--filter-profile",
+                "--filter-profiles-path",
+                str(path),
+            ]
+        )
+        assert code == EXIT_OK
+        assert len(exported_leads(tmp_path)) == 2
+        # Named per path, so a multi-rule profile says which requirement bit.
+        assert read_report(tmp_path)["rejections"]["by_rule"] == {"require_person_email": 1}
+
+
+class TestUmbrellaProfile:
+    """``--profile NAME``: one name, both halves — search and qualification."""
+
+    #: The files shipped in the repository, by absolute path: the isolation
+    #: fixture chdirs into a tmp_path, so the relative defaults would not resolve.
+    SEARCH = Path(__file__).resolve().parents[1] / "config" / "search_profiles.yaml"
+    FILTERS = Path(__file__).resolve().parents[1] / "config" / "filters.yaml"
+
+    @classmethod
+    def paths(cls) -> list[str]:
+        return [
+            "--search-profiles-path",
+            str(cls.SEARCH),
+            "--filter-profiles-path",
+            str(cls.FILTERS),
+        ]
+
+    @staticmethod
+    def settings_for(argv: list[str]) -> Settings:
+        return build_settings(build_parser().parse_args(argv))
+
+    def test_one_name_fills_both_halves(self) -> None:
+        settings = self.settings_for(["--profile", "singapore_tech", *self.paths()])
+        assert settings.profile == "singapore_tech"
+        assert settings.search_profile == "singapore_tech"
+        assert settings.filter_profile == "singapore_tech"
+        assert settings.filters.is_active is True
+
+    def test_the_hyphenated_spelling_works(self) -> None:
+        # How the name is most likely to be typed, and what the prompt example
+        # uses — the shipped profile is named with an underscore for consistency.
+        settings = self.settings_for(["--profile", "singapore-tech", *self.paths()])
+        assert settings.search_profile == "singapore_tech"
+
+    def test_a_search_only_name_leaves_the_filter_half_alone(self) -> None:
+        # A strategy that only narrows the search is still a strategy; the half it
+        # does not define must not be emptied or invented.
+        settings = self.settings_for(["--profile", "sea_fintech", *self.paths()])
+        assert settings.search_profile == "sea_fintech"
+        assert settings.filter_profile is None
+        assert settings.filters == FilterSettings()
+
+    def test_a_filter_only_name_leaves_the_search_half_alone(self) -> None:
+        settings = self.settings_for(["--profile", "enterprise_na", *self.paths()])
+        assert settings.filter_profile == "enterprise_na"
+        assert settings.search_profile is None
+
+    def test_a_missing_half_keeps_the_environment_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The umbrella said nothing about search, so whatever else selected that
+        # half still stands — it must not be cleared just because the umbrella
+        # did not cover it.
+        monkeypatch.setenv("LEAD_SEARCH_PROFILE", "sea_fintech")
+        settings = self.settings_for(["--profile", "enterprise_na", *self.paths()])
+        assert settings.search_profile == "sea_fintech"
+        assert settings.filter_profile == "enterprise_na"
+
+    def test_the_umbrella_beats_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A flag on the command line is the more specific request.
+        monkeypatch.setenv("LEAD_FILTER_PROFILE", "enterprise_na")
+        monkeypatch.setenv("LEAD_SEARCH_PROFILE", "sea_fintech")
+        settings = self.settings_for(["--profile", "singapore_tech", *self.paths()])
+        assert settings.filter_profile == "singapore_tech"
+        assert settings.search_profile == "singapore_tech"
+
+    def test_an_explicit_half_beats_the_umbrella(self) -> None:
+        # A one-off run can keep a strategy's search and swap its qualification
+        # rules without editing a file.
+        settings = self.settings_for(
+            ["--profile", "singapore_tech", "--filter-profile", "enterprise_na", *self.paths()]
+        )
+        assert settings.search_profile == "singapore_tech"
+        assert settings.filter_profile == "enterprise_na"
+        assert settings.filters.include_countries == ["US", "CA"]
+
+    def test_the_umbrella_comes_from_the_environment_too(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LEAD_PROFILE", "singapore_tech")
+        settings = self.settings_for(self.paths())
+        assert settings.search_profile == "singapore_tech"
+
+    def test_no_profile_reads_neither_file(self) -> None:
+        # Still inert by default: paths pointing nowhere must not break a run
+        # that never named a profile.
+        settings = self.settings_for(
+            ["--search-profiles-path", "gone.yaml", "--filter-profiles-path", "gone.yaml"]
+        )
+        assert settings.search_profile is None and settings.filter_profile is None
+
+    def test_an_unknown_name_is_a_config_error_before_any_crawl(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        code = cli(["--source", "mock", "--profile", "nope", *self.paths(), "--dry-run"])
+        assert code == EXIT_CONFIG
+        err = capsys.readouterr().err
+        assert "unknown profile" in err
+        # The alternatives, because a typo is the usual cause and neither file is
+        # open in front of whoever is reading the error.
+        assert "singapore_tech" in err
+        assert "sea_fintech" in err
+
+    def test_a_broken_filter_half_is_a_config_error(self, tmp_path: Path) -> None:
+        # Refused whole rather than half-applied: a run that quietly qualified
+        # against no rules would look exactly like one that worked.
+        filters = tmp_path / "filters.yaml"
+        filters.write_text("broken:\n  required_fields: [company.nmae]\n", encoding="utf-8")
+        search = tmp_path / "search.yaml"
+        search.write_text("broken:\n  titles: [CTO]\n", encoding="utf-8")
+        code = cli(
+            [
+                "--source",
+                "mock",
+                "--profile",
+                "broken",
+                "--search-profiles-path",
+                str(search),
+                "--filter-profiles-path",
+                str(filters),
+                "--dry-run",
+            ]
+        )
+        assert code == EXIT_CONFIG
+
+    def test_the_listing_marks_which_halves_each_name_covers(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        assert cli(["--list-profiles", *self.paths()]) == EXIT_OK
+        out = capsys.readouterr().out
+        # The whole point of the listing: seeing at a glance that `sea_fintech`
+        # is search-only and `enterprise_na` filter-only.
+        assert "singapore_tech" in out and "search+filters" in out
+        assert "sea_fintech" in out
+        assert "enterprise_na" in out
+
+    def test_the_listing_uses_the_configured_paths(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        search = tmp_path / "search.yaml"
+        search.write_text("custom:\n  titles: [CTO]\n", encoding="utf-8")
+        filters = tmp_path / "filters.yaml"
+        filters.write_text("custom:\n  allowed_titles: [CTO]\n", encoding="utf-8")
+        monkeypatch.setenv("LEAD_SEARCH_PROFILES_PATH", str(search))
+        monkeypatch.setenv("LEAD_FILTER_PROFILES_PATH", str(filters))
+        assert cli(["--list-profiles"]) == EXIT_OK
+        assert "custom" in capsys.readouterr().out
+
+    def test_the_umbrella_drives_the_run(
+        self, csv_with_one_email_less_row: Path, tmp_path: Path
+    ) -> None:
+        # The settings object is not the deliverable; the filtered run is.
+        search = tmp_path / "search.yaml"
+        search.write_text("strict:\n  titles: [CTO]\n", encoding="utf-8")
+        filters = tmp_path / "filters.yaml"
+        filters.write_text("strict:\n  required_fields: [person.email]\n", encoding="utf-8")
+        code = cli(
+            [
+                "--source",
+                "csv",
+                "--csv-path",
+                str(csv_with_one_email_less_row),
+                "--output-dir",
+                str(tmp_path),
+                "--format",
+                "csv",
+                "--profile",
+                "strict",
+                "--search-profiles-path",
+                str(search),
+                "--filter-profiles-path",
+                str(filters),
+            ]
+        )
+        assert code == EXIT_OK
+        assert len(exported_leads(tmp_path)) == 2
+        assert read_report(tmp_path)["rejections"]["by_rule"] == {"require_person_email": 1}
+
+
 class TestRuns:
     def test_mock_run_writes_every_requested_format(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -270,10 +597,17 @@ class TestRuns:
         )
         assert code == EXIT_OK
         rows = exported_leads(tmp_path)
-        assert {row["full_name"] for row in rows} == {"Ada Lovelace", "Grace Hopper", "Alan Turing"}
+        assert {row["person_full_name"] for row in rows} == {
+            "Ada Lovelace",
+            "Grace Hopper",
+            "Alan Turing",
+        }
         # Values are normalized on the way through, not merely copied.
         assert all(row["lead_id"] for row in rows)
-        assert next(row for row in rows if row["last_name"] == "Lovelace")["job_title"] == "CTO"
+        assert (
+            next(row for row in rows if row["person_last_name"] == "Lovelace")["person_job_title"]
+            == "CTO"
+        )
 
     def test_lead_ids_are_stable_across_runs(
         self, csv_with_one_email_less_row: Path, tmp_path: Path
@@ -371,7 +705,10 @@ class TestRuns:
                 "--require-email",
             ]
         )
-        assert {row["last_name"] for row in exported_leads(tmp_path)} == {"Lovelace", "Turing"}
+        assert {row["person_last_name"] for row in exported_leads(tmp_path)} == {
+            "Lovelace",
+            "Turing",
+        }
         assert read_report(tmp_path)["rejections"]["by_rule"] == {"require_email": 1}
 
     def test_explicit_flag_overrides_the_environment(

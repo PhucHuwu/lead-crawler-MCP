@@ -2,7 +2,13 @@
 
     python -m src.main
     python -m src.main --source apollo --limit 100
+    python -m src.main --source apollo --profile singapore_tech
     python -m src.main --source csv --csv-path leads.csv --format csv,jsonl
+
+``--profile NAME`` is the umbrella over a whole acquisition strategy: the same
+name is looked up in the search profiles file and the filter profiles file, so
+one word selects who to look for and which of them to keep. ``--search-profile``
+and ``--filter-profile`` name one half each and win over it.
 
 Logs go to stderr; the run summary goes to stdout, so ``--log-format json``
 composes cleanly with shell pipelines.
@@ -24,8 +30,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
 from src import __version__
-from src.config import load_settings
+from src.config import FilterSettings, load_settings
+from src.filter_profiles import (
+    DEFAULT_PROFILE_NAME,
+    DEFAULT_PROFILES_PATH,
+    get_filter_profile,
+    load_filter_profiles,
+)
 from src.models.enums import DedupStrategy, LogFormat
+from src.profiles import HALVES, profile_names, resolve_profile
 from src.utils.errors import ConfigError, ExportError, LeadCrawlerError
 from src.utils.logging import configure_logging, get_logger
 from src.utils.time import utcnow
@@ -34,6 +47,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from src.config import Settings
+    from src.filter_profiles import FilterProfile
     from src.models.results import CrawlResult
 
 
@@ -140,6 +154,21 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     sources.add_argument(
+        "--profile",
+        metavar="NAME",
+        help=(
+            "Acquisition strategy: the profile of this name in BOTH profile files. "
+            "A name defined in only one of them applies in only one place. "
+            "Overrides --search-profile/--filter-profile from the environment; "
+            "those flags on the command line override this."
+        ),
+    )
+    sources.add_argument(
+        "--list-profiles",
+        action="store_true",
+        help="List the profiles defined across both profile files and exit.",
+    )
+    sources.add_argument(
         "--search-profile",
         nargs="?",
         const="default",
@@ -226,9 +255,40 @@ def build_parser() -> argparse.ArgumentParser:
     filters.add_argument("--exclude-domains", metavar="LIST", help="Company domains to drop.")
     filters.add_argument("--seniority", metavar="LIST", help="Keep only these seniority levels.")
     filters.add_argument("--exclude-seniority", metavar="LIST", help="Drop these seniority levels.")
+    filters.add_argument(
+        "--titles", metavar="LIST", help="Keep only these exact job titles (whole-title match)."
+    )
+    filters.add_argument("--exclude-titles", metavar="LIST", help="Drop these exact job titles.")
     filters.add_argument("--title-keywords", metavar="LIST", help="Job title must contain one.")
     filters.add_argument(
         "--exclude-title-keywords", metavar="LIST", help="Job title must contain none."
+    )
+    filters.add_argument(
+        "--required-fields",
+        metavar="PATHS",
+        help="Drop leads missing any of these dotted paths, e.g. company.name,person.email.",
+    )
+    filters.add_argument(
+        "--filter-profile",
+        nargs="?",
+        const=DEFAULT_PROFILE_NAME,
+        metavar="NAME",
+        help=(
+            "Named qualification profile from the filter profiles file. "
+            "Bare --filter-profile means the 'default' profile. Profile rules are "
+            "the base; explicit filter flags below override them."
+        ),
+    )
+    filters.add_argument(
+        "--filter-profiles-path",
+        type=Path,
+        metavar="PATH",
+        help="Filter profiles file (default: LEAD_FILTER_PROFILES_PATH).",
+    )
+    filters.add_argument(
+        "--list-filter-profiles",
+        action="store_true",
+        help="List the profiles defined in the filter profiles file and exit.",
     )
     _add_bool_pair(filters, "require-email", "Keep only leads with an email address.")
     _add_bool_pair(filters, "require-linkedin", "Keep only leads with a LinkedIn URL.")
@@ -292,8 +352,11 @@ def _filter_overrides(args: argparse.Namespace) -> dict[str, Any]:
         "exclude_domains": _split_opt(args.exclude_domains),
         "include_seniority": _split_opt(args.seniority),
         "exclude_seniority": _split_opt(args.exclude_seniority),
+        "include_titles": _split_opt(args.titles),
+        "exclude_titles": _split_opt(args.exclude_titles),
         "include_title_keywords": _split_opt(args.title_keywords),
         "exclude_title_keywords": _split_opt(args.exclude_title_keywords),
+        "required_fields": _split_opt(args.required_fields),
         "require_email": args.require_email,
         "require_linkedin": args.require_linkedin,
         "require_company_domain": args.require_company_domain,
@@ -303,8 +366,74 @@ def _filter_overrides(args: argparse.Namespace) -> dict[str, Any]:
     return {key: value for key, value in mapping.items() if value not in (None, [])}
 
 
+def _resolve_filters(args: argparse.Namespace, base: Settings) -> FilterSettings:
+    """Combine the environment, a named profile and the CLI into one rule set.
+
+    Precedence, weakest first: the environment's ``LEAD_FILTERS__*`` values, then
+    a named filter profile, then the filter flags on the command line.
+
+    The profile *replaces* the environment's rules rather than layering onto
+    them. A profile is a complete statement of which leads we keep, and merging
+    it with whatever happened to be exported in the shell would make the same
+    named profile mean different things on different machines — the opposite of
+    what naming it is for. Explicit flags still win over both, so a one-off run
+    can narrow a shared profile without editing the file.
+    """
+    profile = get_filter_profile(base.filter_profile, path=base.filter_profiles_path)
+    rules = profile.to_filter_settings() if profile is not None else base.filters
+
+    overrides = _filter_overrides(args)
+    if not overrides:
+        return rules
+    return FilterSettings(**{**rules.model_dump(), **overrides})
+
+
+def _apply_umbrella(args: argparse.Namespace, base: Settings) -> Settings:
+    """Fill ``search_profile``/``filter_profile`` in from the umbrella ``--profile``.
+
+    Precedence, weakest first: the environment (already folded into ``base``), the
+    umbrella ``--profile``, then an explicit ``--search-profile`` or
+    ``--filter-profile``. An explicitly named half is the more specific request,
+    so it wins; the umbrella supplies only the halves nothing else named.
+
+    A strategy defined in only one file fills in only that half and leaves the
+    other exactly as the environment had it. That is what makes a search-only or
+    filter-only profile a legitimate strategy rather than half a broken one — and
+    the missing half is logged, because the run is otherwise indistinguishable
+    from one where the profile covered both sides.
+
+    Raises:
+        ConfigError: if the named profile is defined in neither file, or its
+            filter rules are invalid. Raised before any crawling starts.
+    """
+    if not base.profile:
+        return base
+
+    resolved = resolve_profile(
+        base.profile,
+        search_path=base.search_profiles_path,
+        filter_path=base.filter_profiles_path,
+    )
+
+    logger = get_logger("main")
+    for half in HALVES:
+        if half not in resolved.defined_halves:
+            logger.info(
+                f"profile {resolved.name!r} defines no {half} half; "
+                f"{half} settings are left as configured",
+                extra={"profile": resolved.name, "half": half},
+            )
+
+    updates: dict[str, Any] = {}
+    if resolved.search is not None and args.search_profile is None:
+        updates["search_profile"] = resolved.name
+    if resolved.filters is not None and args.filter_profile is None:
+        updates["filter_profile"] = resolved.name
+    return base.model_copy(update=updates) if updates else base
+
+
 def build_settings(args: argparse.Namespace) -> Settings:
-    """Merge CLI flags over the environment."""
+    """Merge CLI flags over the environment, then apply the named profiles."""
     overrides: dict[str, Any] = {
         # --verbose is sugar for the one log level it names; the two are mutually
         # exclusive at the parser, so there is no precedence question to resolve.
@@ -316,16 +445,16 @@ def build_settings(args: argparse.Namespace) -> Settings:
         "dedup_strategy": args.dedup,
         "min_completeness": args.min_completeness,
         "sort_by_completeness": args.sort_by_completeness,
+        "profile": args.profile,
         "search_profile": args.search_profile,
         "search_profiles_path": args.search_profiles_path,
+        "filter_profile": args.filter_profile,
+        "filter_profiles_path": args.filter_profiles_path,
     }
 
     formats = _split_csv_arg(args.format)
     if formats:
         overrides["output_formats"] = formats
-
-    if filter_overrides := _filter_overrides(args):
-        overrides["filters"] = filter_overrides
 
     if args.csv_path is not None:
         overrides["csv_source"] = {"path": args.csv_path}
@@ -333,10 +462,16 @@ def build_settings(args: argparse.Namespace) -> Settings:
     if website_urls := _split_csv_arg(args.website_url):
         overrides["website"] = {"urls": website_urls}
 
-    return load_settings(
+    base = load_settings(
         env_file=args.config,
         **{key: value for key, value in overrides.items() if value is not None},
     )
+    # Profiles are resolved after the base settings exist, because both the file
+    # paths and the profile names come from settings — flag or environment — and
+    # none of them is known before that call. Filters then resolve last, since the
+    # rule set is what the filter profile and the filter flags have to agree on.
+    named = _apply_umbrella(args, base)
+    return named.model_copy(update={"filters": _resolve_filters(args, named)})
 
 
 # --------------------------------------------------------------------------- #
@@ -363,6 +498,74 @@ def _print_formats() -> None:
     print("\nUse with: --format <name> (repeat or comma-separate)")
 
 
+def _summarize_profile(profile: FilterProfile) -> str:
+    """One line naming the rules a profile actually sets.
+
+    Only non-default rules are listed, so the line reads as the profile's
+    opinions rather than as a dump of its schema.
+    """
+    parts: list[str] = []
+    if profile.allowed_titles:
+        parts.append(f"{len(profile.allowed_titles)} allowed titles")
+    if profile.blocked_titles:
+        parts.append(f"{len(profile.blocked_titles)} blocked titles")
+    if profile.allowed_countries:
+        parts.append(f"countries {'/'.join(profile.allowed_countries)}")
+    if profile.seniority:
+        parts.append(f"seniority {'/'.join(profile.seniority)}")
+
+    low, high = profile.minimum_employee_count, profile.maximum_employee_count
+    if low is not None or high is not None:
+        parts.append(f"{low if low is not None else 0}-{high if high is not None else 'any'} staff")
+    if profile.required_fields:
+        parts.append(f"requires {', '.join(profile.required_fields)}")
+    return "; ".join(parts) or "no rules (keeps everything)"
+
+
+def _print_filter_profiles(args: argparse.Namespace) -> None:
+    """List the profiles defined in the filter profiles file.
+
+    The path comes from ``--filter-profiles-path``, else from the environment, so
+    the listing names the same file a run would read. An environment error
+    surfaces here as a configuration error rather than being papered over with the
+    built-in default, which would list profiles the run would never load.
+    """
+    path = args.filter_profiles_path
+    if path is None:
+        path = load_settings(env_file=args.config).filter_profiles_path
+
+    profiles = load_filter_profiles(path)
+    print(f"Filter profiles in {path}:\n")
+    for name, profile in sorted(profiles.items()):
+        print(f"  {name:<20} {_summarize_profile(profile)}")
+        if profile.description:
+            print(f"  {'':<20} {profile.description}")
+    print(f"\nUse with: --filter-profile <name> (default file: {DEFAULT_PROFILES_PATH})")
+
+
+def _print_profiles(args: argparse.Namespace) -> None:
+    """List every profile name across both profile files, with the halves each covers.
+
+    Both files are read, because that is what ``--profile`` does. A name that
+    appears in only one of them is precisely the fact this listing exists to make
+    visible, so listing one file's names would hide the thing worth seeing.
+    """
+    settings = load_settings(env_file=args.config)
+    search_path = args.search_profiles_path or settings.search_profiles_path
+    filter_path = args.filter_profiles_path or settings.filter_profiles_path
+
+    entries = profile_names(search_path=search_path, filter_path=filter_path)
+    where = f"{search_path} and {filter_path}" if search_path != filter_path else str(search_path)
+    print(f"Profiles in {where}:\n")
+    for name, halves in entries:
+        covered = "+".join(half for half in HALVES if half in halves)
+        print(f"  {name:<20} {covered}")
+    if not entries:
+        print("  <none>")
+    print("\nUse with: --profile <name>, which applies every half named above.")
+    print("          --search-profile <name> / --filter-profile <name> select one half.")
+
+
 def _print_summary(result: CrawlResult, outputs: Sequence[Path], *, dry_run: bool) -> None:
     stats = result.stats
     print()
@@ -372,11 +575,25 @@ def _print_summary(result: CrawlResult, outputs: Sequence[Path], *, dry_run: boo
     print(f"  raw collected      {stats.raw_collected}")
     print(f"  normalized         {stats.normalized}")
     print(f"  failed validation  {stats.validation_failed}")
+    if stats.validation_warned:
+        print(f"  flagged (kept)     {stats.validation_warned}")
     print(f"  filtered out       {stats.filtered_out}")
+    print(f"  before dedup       {stats.records_before_deduplication}")
     print(f"  duplicates merged  {stats.duplicates_removed}")
+    if stats.duplicates_removed:
+        # Only worth the two extra lines when something was actually collapsed;
+        # the split is what says whether the merge was provable or inferred.
+        print(f"    exact            {stats.exact_duplicates}")
+        print(f"    probable         {stats.probable_duplicates}")
+    print(f"  after dedup        {stats.records_after_deduplication}")
     print(f"  leads kept         {len(result.leads)}")
     if stats.duration_seconds is not None:
         print(f"  duration           {stats.duration_seconds:.2f}s")
+
+    if stats.per_validation_reason:
+        print("\n  validation rules:")
+        for rule, count in sorted(stats.per_validation_reason.items(), key=lambda kv: -kv[1]):
+            print(f"    {rule:<28} {count}")
 
     if stats.per_filter_reason:
         print("\n  filtered by rule:")
@@ -450,7 +667,9 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
             "min_completeness": settings.min_completeness,
             "sort_by_completeness": settings.sort_by_completeness,
             "filters_active": settings.filters.is_active,
+            "profile": settings.profile,
             "search_profile": settings.search_profile,
+            "filter_profile": settings.filter_profile,
             "website_urls": len(settings.website.urls),
             "max_concurrency": settings.max_concurrency,
             "http_max_attempts": settings.http_max_attempts,
@@ -474,7 +693,7 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
 
     outputs: list[Path] = []
     if not args.dry_run:
-        outputs = await _export(args, settings, result, limit=limit)
+        outputs = await _export(args, settings, result, limit=limit, sources=requested)
 
     _print_summary(result, outputs, dry_run=args.dry_run)
 
@@ -510,23 +729,33 @@ async def _export(
     result: CrawlResult,
     *,
     limit: int,
+    sources: Sequence[str] = (),
 ) -> list[Path]:
     """Write the requested exports and return the paths written.
 
     Two layouts, chosen by the flag the user passed:
 
     ``--output PATH``      exactly that file, next to a ``<stem>_report.json``.
-    ``--output-dir DIR``   ``<prefix>_<timestamp>.<ext>`` per format, timestamped
-                           so successive runs accumulate instead of overwriting.
+    ``--output-dir DIR``   ``<prefix>_<source>_<timestamp>.<ext>`` per format,
+                           timestamped so successive runs accumulate instead of
+                           overwriting, and labelled with the source so files
+                           from different campaigns are told apart by name.
+
+    ``sources`` is the set of providers the run requested — passed in rather than
+    read off the result, because a source that failed returned no counts yet
+    still belongs in the name of the run that asked for it.
     """
-    from src.exporters import build_exporter, write_run_report
+    from src.exporters import build_exporter, source_slug, write_run_report
 
     _check_output_target(args, settings)
 
     logger = get_logger("main")
     formats = settings.active_formats()
     outputs: list[Path] = []
-    timestamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
+    # UTC, matching every other timestamp the tool emits: the filename, the
+    # report and the log lines then order the same way without a zone puzzle.
+    timestamp = utcnow().strftime("%Y-%m-%d_%H-%M-%S")
+    slug = source_slug(sources)
 
     if args.output is not None:
         directory = args.output.parent
@@ -535,11 +764,11 @@ async def _export(
     else:
         directory = settings.ensure_output_dir()
         fixed_path = None
-        report_path = directory / f"{settings.output_prefix}_{timestamp}_report.json"
+        report_path = directory / f"{settings.output_prefix}_{slug}_{timestamp}_report.json"
 
     for fmt in formats:
         exporter = build_exporter(fmt, settings)
-        path = fixed_path or exporter.build_path(directory, settings.output_prefix, timestamp)
+        path = fixed_path or exporter.build_path(directory, settings.output_prefix, slug, timestamp)
         export_result = await exporter.export(result.leads, path)
         outputs.append(export_result.path)
         result.stats.output_files.append(str(export_result.path))
@@ -554,7 +783,9 @@ async def _export(
         )
 
     if settings.write_run_report:
-        outputs.append(await write_run_report(result, report_path, settings, limit=limit))
+        outputs.append(
+            await write_run_report(result, report_path, settings, limit=limit, sources=sources)
+        )
 
     return outputs
 
@@ -576,6 +807,12 @@ def cli(argv: Sequence[str] | None = None) -> int:
         return EXIT_OK
     if args.list_formats:
         _print_formats()
+        return EXIT_OK
+    if args.list_filter_profiles:
+        _print_filter_profiles(args)
+        return EXIT_OK
+    if args.list_profiles:
+        _print_profiles(args)
         return EXIT_OK
 
     try:
