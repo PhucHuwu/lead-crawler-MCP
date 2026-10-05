@@ -367,6 +367,64 @@ class MockSettings(BaseModel):
     duplicate_ratio: float = Field(default=0.15, ge=0.0, le=1.0)
 
 
+class BrowserSettings(BaseModel):
+    """Real-browser configuration, shared by every browser-backed source.
+
+    The crawler drives a real Chromium through CloakBrowser rather than calling
+    an API, so what used to be "an HTTP client's timeout" is now a process, a
+    profile directory on disk and a concurrency limit that a license enforces.
+    Each of those needs a knob, and none of them may be hardcoded.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    #: Which browser backend to use. ``cloakbrowser`` is the only registered
+    #: provider today; the value exists so the MCP provider the architecture is
+    #: being prepared for can be selected without touching crawler code.
+    provider: str = "cloakbrowser"
+
+    #: Run Chromium without a visible window. ``--login`` overrides this to
+    #: ``False`` for its own bootstrap, since signing in needs a window.
+    headless: bool = True
+
+    #: Concurrent browser sessions. CloakBrowser's free tier permits **one**, and
+    #: each persistent context is its own Chromium process, so with the default
+    #: two browser-backed sources in one run serialize: the second waits for the
+    #: first to close. Raise this only with a Pro license key. The pipeline's
+    #: ``max_concurrency`` does not and cannot exceed it.
+    max_sessions: int = Field(default=1, ge=1, le=16)
+
+    #: Pro license key. ``SecretStr`` so it stays out of ``repr``, out of
+    #: serialized settings, and is collected by :func:`iter_secret_values` for
+    #: log redaction automatically.
+    license_key: SecretStr | None = None
+
+    #: Root under which each source gets its own persistent profile directory
+    #: (``<profile_root>/<source>``). Holds live session cookies, so it is
+    #: gitignored and never copied into diagnostics.
+    profile_root: Path = Path("data/browser_profiles")
+
+    #: Explicit profile directory, overriding ``profile_root`` entirely. This is
+    #: how an operator points at a profile they prepared elsewhere — for example
+    #: a copy of their own Chrome profile — instead of using ``--login``.
+    user_data_dir: Path | None = None
+
+    #: Default bound for a single interaction that is not otherwise bounded.
+    default_timeout: float = Field(default=30.0, gt=0)
+    #: Bound for a navigation. Larger than ``default_timeout`` because a
+    #: JS-heavy application page legitimately takes longer than a form submit.
+    nav_timeout: float = Field(default=45.0, gt=0)
+
+    #: Where ``--debug-artifacts`` writes. Off by default: these files quote page
+    #: content from a signed-in session.
+    debug_dir: Path = Path("debug")
+    debug_artifacts: bool = False
+    #: Total bytes and file count for one run, and how many past runs to keep.
+    debug_max_bytes: int = Field(default=50 * 1024 * 1024, ge=0)
+    debug_max_files: int = Field(default=200, ge=1)
+    debug_keep_runs: int = Field(default=5, ge=0)
+
+
 class Settings(BaseSettings):
     """Root application settings."""
 
@@ -444,6 +502,7 @@ class Settings(BaseSettings):
     csv_source: CsvSourceSettings = Field(default_factory=CsvSourceSettings)
     mock: MockSettings = Field(default_factory=MockSettings)
     website: WebsiteSettings = Field(default_factory=WebsiteSettings)
+    browser: BrowserSettings = Field(default_factory=BrowserSettings)
 
     # ------------------------------------------------------------------ #
     # Helpers

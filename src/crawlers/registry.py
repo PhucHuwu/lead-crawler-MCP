@@ -7,9 +7,9 @@ is the extension point that keeps new sources out of the core.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
-from src.crawlers.base import BaseCrawler
+from src.crawlers.base import BaseCrawler, BrowserCrawler
 from src.utils.errors import ConfigError, SourceNotFoundError
 
 if TYPE_CHECKING:
@@ -53,14 +53,23 @@ def get_crawler_class(name: str) -> type[BaseCrawler]:
     return _REGISTRY[slug]
 
 
-def build_crawler(name: str, settings: Settings) -> BaseCrawler:
+def build_crawler(
+    name: str, settings: Settings, *, browser: Any = None
+) -> BaseCrawler:
     """Instantiate the crawler registered under ``name``.
+
+    ``browser`` optionally injects a :class:`~src.browser.session.BrowserManager`.
+    It exists so a test can supply a fake at the seam rather than reaching into
+    module globals, and it is a keyword-only argument with a ``None`` default so
+    the contract every existing source relies on is unchanged.
 
     Raises:
         SourceNotFoundError: if the source is unknown.
         ConfigError: if the source needs credentials that are not configured.
     """
-    crawler = get_crawler_class(name)(settings)
+    cls = get_crawler_class(name)
+    accepts_browser = issubclass(cls, BrowserCrawler)
+    crawler = cls(settings, browser=browser) if accepts_browser else cls(settings)
     ok, reason = crawler.is_available()
     if not ok:
         raise ConfigError(f"source {crawler.provider!r} is not usable: {reason}")

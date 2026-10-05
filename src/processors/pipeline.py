@@ -159,6 +159,11 @@ class Pipeline:
         collected: list[RawLead] = []
         for crawler, result in zip(crawlers, results, strict=True):
             provider = crawler.provider
+            # Recorded before the failure check: a browser source that died
+            # halfway still visited the pages it reached, and dropping that makes
+            # a systemic failure indistinguishable from a source that found
+            # nothing at all.
+            stats.record_browser_counts(crawler.browser_counters())
             if isinstance(result, BaseException):
                 message = str(result)
                 stats.record_source_error(provider, message)

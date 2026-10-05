@@ -20,6 +20,14 @@ import json
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, ClassVar, Self
 
+from src.browser.auth import LoginWall
+from src.browser.base import SessionSpec
+from src.browser.session import (
+    BrowserManager,
+    BrowserSession,
+    build_session_spec,
+    get_browser_manager,
+)
 from src.models.lead import RawLead
 from src.utils.logging import get_logger
 
@@ -100,6 +108,14 @@ class BaseCrawler(ABC):
             setting rather than say "unavailable".
         """
         return True, ""
+
+    def browser_counters(self) -> dict[str, int]:
+        """Pages visited and browser failures for this source.
+
+        Empty for a source that does not drive a browser, so the pipeline can
+        ask every crawler the same question rather than type-testing them.
+        """
+        return {}
 
     # ------------------------------------------------------------------ #
     # Record mapping
@@ -184,3 +200,92 @@ class BaseCrawler(ABC):
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} provider={self.provider!r}>"
+
+
+class BrowserCrawler(BaseCrawler):
+    """A source driven through a real browser instead of an HTTP client.
+
+    Kept as a separate subclass rather than folded into :class:`BaseCrawler` so
+    that sources which need no browser — ``csv``, ``mock`` — keep exactly the
+    contract they had, including being constructible without one.
+
+    The session is opened lazily on first use and reused for the crawler's
+    lifetime. A browser costs seconds to start, and the free tier permits one at
+    a time, so acquiring one per page would be both slow and self-defeating.
+    """
+
+    #: What this source's signed-out state looks like, or ``None`` for a source
+    #: with no login at all. Declared here so the guard in
+    #: :meth:`~src.browser.session.BrowserSession.goto` can reject a login page
+    #: before the adapter is handed it.
+    login_wall: ClassVar[LoginWall | None] = None
+
+    #: Persistent sources keep cookies on disk between runs, which is what makes
+    #: a signed-in session survive. A source that reads public pages does not
+    #: need one and should not pay for it.
+    persistent_session: ClassVar[bool] = False
+
+    #: Anti-fingerprinting arguments. On for a source being driven as an
+    #: application; deliberately off for one that identifies itself honestly,
+    #: since a forced-stealth fingerprint contradicting an honest user agent is
+    #: itself a signal.
+    stealth: ClassVar[bool] = True
+
+    user_agent: ClassVar[str | None] = None
+
+    def __init__(self, settings: Settings, *, browser: BrowserManager | None = None) -> None:
+        super().__init__(settings)
+        self._browser = browser
+        self._session: BrowserSession | None = None
+
+    # ------------------------------------------------------------------ #
+    # Session
+    # ------------------------------------------------------------------ #
+    def session_spec(self) -> SessionSpec:
+        """Describe the browser session this source needs."""
+        return build_session_spec(
+            self.settings,
+            self.provider,
+            persistent=self.persistent_session,
+            stealth=self.stealth,
+            user_agent=self.user_agent,
+        )
+
+    @property
+    def browser(self) -> BrowserManager:
+        """The run's browser manager, created on first use."""
+        if self._browser is None:
+            self._browser = get_browser_manager(self.settings)
+        return self._browser
+
+    async def session(self) -> BrowserSession:
+        """The source's browser session, opened on first use.
+
+        Reopened if it was closed, so a ``crawl()`` after an ``aclose()`` works
+        rather than failing on a stale handle.
+        """
+        if self._session is None or self._session.closed:
+            self._session = await self.browser.session_for(
+                self.session_spec(), login_wall=self.login_wall
+            )
+        return self._session
+
+    async def aclose(self) -> None:
+        """Close the session. Safe to call twice."""
+        session = self._session
+        self._session = None
+        if session is not None:
+            await session.aclose()
+
+    def is_available(self) -> tuple[bool, str]:
+        """Whether a browser can be started here at all.
+
+        Cheap and offline: it consults the provider's own check, which reads the
+        filesystem and never downloads or launches. A source that also needs a
+        signed-in profile overrides this to add that check.
+        """
+        return self.browser.is_available()
+
+    def browser_counters(self) -> dict[str, int]:
+        """Pages visited and browser failures for this source."""
+        return self.browser.debug.counters(self.provider).as_dict()

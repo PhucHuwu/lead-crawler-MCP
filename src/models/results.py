@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -66,6 +67,18 @@ class CrawlStats(BaseModel):
     #: measurement, not arithmetic that must stay in step with other counters.
     records_before_deduplication: int = 0
     exported: int = 0
+
+    #: Pages the browser actually loaded. The one figure that distinguishes "the
+    #: site had nothing" from "we never got there", which no lead count can.
+    pages_visited: int = 0
+    #: Navigations that failed, and pages that errored while being read.
+    browser_errors: int = 0
+    #: Selector waits that timed out. A rise here is the early warning that a
+    #: site changed shape, and it usually precedes a fall in ``raw_collected``
+    #: by a run or two.
+    selector_failures: int = 0
+    #: Navigations rejected by a source's login wall.
+    auth_failures: int = 0
 
     #: Raw leads received per provider, before any processing.
     per_provider: dict[str, int] = Field(default_factory=dict)
@@ -137,6 +150,19 @@ class CrawlStats(BaseModel):
 
     def record_source_error(self, provider: str, message: str) -> None:
         self.source_errors[provider] = message
+
+    def record_browser_counts(self, counts: Mapping[str, int]) -> None:
+        """Fold one source's browser counters into the run totals.
+
+        Called for every browser-backed source, including ones that failed: a
+        crawl that died halfway still visited the pages it reached, and
+        discarding that makes a systemic failure look like a source that simply
+        found nothing.
+        """
+        self.pages_visited += counts.get("pages_visited", 0)
+        self.browser_errors += counts.get("browser_errors", 0)
+        self.selector_failures += counts.get("selector_failures", 0)
+        self.auth_failures += counts.get("auth_failures", 0)
 
     def finalize(self) -> None:
         """Stamp the end of the run. Idempotent."""

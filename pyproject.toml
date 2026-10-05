@@ -20,6 +20,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# The browser-backed sources (``apollo``, ``website``) need this extra. It is
+# optional so ``--source csv``/``--source mock`` keep working on a machine with
+# no Chromium; ``src/browser/cloak.py`` imports both lazily and reports a clear
+# message when they are missing.
+browser = [
+    "cloakbrowser>=0.5.12",
+    # Declared explicitly rather than relied on transitively: ``src/browser``
+    # imports ``playwright`` directly, so it is a first-class dependency here.
+    "playwright>=1.40",
+]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
@@ -38,10 +48,17 @@ packages = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-q --strict-markers"
+# Real-browser tiers are excluded by default: the socket guard in
+# ``tests/conftest.py`` patches this process, and Chromium is a child process
+# with its own sockets, so the guard cannot contain it. Opt in explicitly with
+# ``-m browser_integration`` (which still additionally requires
+# ``LEAD_TEST_REAL_BROWSER=1``).
+addopts = "-q --strict-markers -m 'not browser_integration and not capture_pages'"
 filterwarnings = ["error::DeprecationWarning:src.*"]
 markers = [
     "allow_network: opt a single test out of the suite-wide network ban (see tests/conftest.py)",
+    "browser_integration: launch real Chromium with all requests served from local snapshots (offline)",
+    "capture_pages: refresh HTML snapshots from the live web (manual only)",
 ]
 
 [tool.ruff]
@@ -69,3 +86,10 @@ explicit_package_bases = true
 [[tool.mypy.overrides]]
 module = ["tests.*"]
 disallow_untyped_defs = false
+
+# ``cloakbrowser`` ships no ``py.typed`` marker, so its own annotations are
+# invisible to mypy. Everything this project *does* with it is annotated at the
+# ``src/browser/cloak.py`` boundary, which is the only place it is imported.
+[[tool.mypy.overrides]]
+module = ["cloakbrowser", "cloakbrowser.*"]
+ignore_missing_imports = true
