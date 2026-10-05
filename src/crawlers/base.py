@@ -7,20 +7,47 @@ filter or deduplicate: those are pipeline stages that all sources share.
 
 Adding a source therefore means adding exactly one module and registering it.
 Nothing in :mod:`src.processors`, :mod:`src.exporters` or the CLI needs to change.
+
+Because the adapter is where an untrusted payload first becomes our data, the
+base class also carries the containment for that step: :meth:`BaseCrawler.map_records`
+turns a source's records into leads one at a time, so a record that cannot be
+mapped costs that record and nothing else.
 """
 
 from __future__ import annotations
 
+import json
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, ClassVar, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Self
 
 from src.models.lead import RawLead
 from src.utils.logging import get_logger
 
 if TYPE_CHECKING:
     import logging
+    from collections.abc import Callable, Iterable
 
     from src.config import Settings
+
+#: Longest record excerpt echoed into a mapping-failure log line. Enough to
+#: identify the record — an id, an email, a name — without turning one bad row
+#: into a screenful of payload.
+_MAX_RECORD_EXCERPT = 300
+
+
+def record_excerpt(record: Any) -> str:
+    """Short, log-safe rendering of a source record that failed to map.
+
+    Truncated and whitespace-collapsed because its job is identification, not
+    reproduction: the full payload is preserved on every record that *does*
+    map, in ``RawLead.raw``.
+    """
+    try:
+        text = json.dumps(record, default=str, ensure_ascii=False)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        text = repr(record)
+    text = " ".join(text.split())
+    return text[:_MAX_RECORD_EXCERPT] + ("…" if len(text) > _MAX_RECORD_EXCERPT else "")
 
 
 class BaseCrawler(ABC):
@@ -73,6 +100,71 @@ class BaseCrawler(ABC):
             setting rather than say "unavailable".
         """
         return True, ""
+
+    # ------------------------------------------------------------------ #
+    # Record mapping
+    # ------------------------------------------------------------------ #
+    def map_records(
+        self,
+        records: Iterable[Any],
+        mapper: Callable[[Any], RawLead | None],
+        *,
+        kind: str = "record",
+        label: Callable[[Any], str] | None = None,
+    ) -> tuple[list[RawLead], int]:
+        """Turn a source's records into leads, containing any that fail.
+
+        A source hands us records it believes are well-formed; an adapter does
+        not get to assume that, and the failure mode of assuming it is ugly —
+        an exception raised while mapping *one* record unwinds the whole
+        :meth:`crawl` call, so every lead collected alongside it is lost and the
+        source is recorded as failed. Containing the failure here costs one
+        record instead.
+
+        Used rather than a bare comprehension in every adapter so the containment
+        cannot be forgotten when the next source is added.
+
+        Args:
+            records: Raw source records, in source order.
+            mapper: Turns one record into a :class:`RawLead`. Returning ``None``
+                means "there was nothing to map here" — a blank CSV row — and is
+                not a failure.
+            kind: What this source calls one record, for the log line
+                (``"person"``, ``"csv row"``).
+            label: Short identifier for a record, used in the log line. Defaults
+                to the record's position, which is all a source with no stable id
+                can offer.
+
+        Returns:
+            ``(leads, failures)`` — the records that mapped, and how many did
+            not. The count is returned rather than only logged so the caller's
+            own summary line can carry it.
+        """
+        leads: list[RawLead] = []
+        failures = 0
+
+        for index, record in enumerate(records):
+            try:
+                lead = mapper(record)
+            except Exception as exc:
+                # Every failure is logged individually, not just counted: the
+                # excerpt is what says *which* record was unreadable, and a bare
+                # total would leave the operator to bisect the source by hand.
+                failures += 1
+                self.logger.warning(
+                    f"could not map {kind}; skipping it",
+                    extra={
+                        "provider": self.provider,
+                        "record": label(record) if label is not None else f"#{index}",
+                        "error": str(exc),
+                        "excerpt": record_excerpt(record),
+                    },
+                )
+                continue
+            if lead is not None:
+                leads.append(lead)
+
+        return leads, failures
 
     # ------------------------------------------------------------------ #
     # Lifecycle
