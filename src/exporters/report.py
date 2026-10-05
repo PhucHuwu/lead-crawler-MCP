@@ -59,6 +59,14 @@ def build_report(
             "duplicates_removed": stats.duplicates_removed,
             "exported": stats.exported,
             "errors": stats.records_invalid,
+            # Browser activity sits beside the record counts because it answers
+            # the question they cannot: "the site had nothing" and "we never
+            # reached the site" produce the same zero in every field above, and
+            # only ``pages_visited`` separates them.
+            "pages_visited": stats.pages_visited,
+            "browser_errors": stats.browser_errors,
+            "selector_failures": stats.selector_failures,
+            "auth_failures": stats.auth_failures,
         },
         "generated_at": to_iso(stats.finished_at),
         "run": {

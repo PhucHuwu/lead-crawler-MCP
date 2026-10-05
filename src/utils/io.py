@@ -17,9 +17,7 @@ from typing import IO
 from src.utils.errors import ConfigError
 
 
-def ensure_directory(
-    path: Path, *, what: str = "directory", mode: int | None = None
-) -> Path:
+def ensure_directory(path: Path, *, what: str = "directory", mode: int | None = None) -> Path:
     """Create ``path`` if it is missing, then confirm it is a directory.
 
     ``what`` names the path in the error message, so a caller can say "output
@@ -98,9 +96,7 @@ def atomic_write(
         raise
 
 
-def atomic_write_text(
-    path: Path, text: str, *, encoding: str = "utf-8", mode: int = 0o644
-) -> int:
+def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8", mode: int = 0o644) -> int:
     """Write ``text`` to ``path`` atomically. Returns the byte length written."""
     with atomic_write(path, encoding=encoding, mode=mode) as handle:
         handle.write(text)

@@ -152,7 +152,9 @@ class BrowserSession:
         try:
             status = await page.goto(url, wait_until=wait_until, timeout=timeout)
         except Exception as exc:
-            await self._capture(page, debug_label or "navigation-failed", "navigation_failed", str(exc))
+            await self._capture(
+                page, debug_label or "navigation-failed", "navigation_failed", str(exc)
+            )
             raise SourceUnavailableError(
                 self.provider_name, f"navigation to {redact_url(url)} failed: {exc}"
             ) from exc
@@ -165,7 +167,9 @@ class BrowserSession:
         if self._auth_guard is not None:
             verdict = await self._auth_guard.check(page)
             if not verdict.authenticated:
-                await self._capture(page, debug_label or "login-wall", "auth_expired", verdict.detail)
+                await self._capture(
+                    page, debug_label or "login-wall", "auth_expired", verdict.detail
+                )
                 raise auth_error(self._auth_guard, verdict, profile_dir=self.spec.user_data_dir)
 
         if required and status is not None and status >= 400:

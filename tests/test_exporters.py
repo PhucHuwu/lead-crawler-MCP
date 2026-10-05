@@ -627,7 +627,34 @@ class TestRunReport:
             "duplicates_removed",
             "exported",
             "errors",
+            "pages_visited",
+            "browser_errors",
+            "selector_failures",
+            "auth_failures",
         }
+
+    def test_the_summary_distinguishes_never_reaching_a_site_from_finding_nothing(
+        self, settings: Settings
+    ) -> None:
+        # Zero leads is ambiguous on its own — an empty site and a crawl that
+        # never loaded a page produce the same record counts. The browser
+        # counters are what tell the two apart, so they belong in the summary
+        # rather than only in the nested stats block.
+        result = self.build_result()
+        result.stats.record_browser_counts(
+            {
+                "pages_visited": 7,
+                "browser_errors": 1,
+                "selector_failures": 2,
+                "auth_failures": 3,
+            }
+        )
+        result.stats.finalize()
+        summary = build_report(result, settings)["summary"]
+        assert summary["pages_visited"] == 7
+        assert summary["browser_errors"] == 1
+        assert summary["selector_failures"] == 2
+        assert summary["auth_failures"] == 3
 
     def test_the_summary_errors_count_records_that_could_not_be_used(
         self, settings: Settings

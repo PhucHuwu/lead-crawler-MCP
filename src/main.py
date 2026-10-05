@@ -591,6 +591,19 @@ def _print_summary(result: CrawlResult, outputs: Sequence[Path], *, dry_run: boo
     if stats.duration_seconds is not None:
         print(f"  duration           {stats.duration_seconds:.2f}s")
 
+    if stats.pages_visited or stats.browser_errors or stats.selector_failures:
+        # Printed only for a run that actually drove a browser, so the output of
+        # an ``http``-less source is unchanged. A failure line appears only when
+        # it happened: a permanent "selector failures 0" trains the reader to
+        # skip the block that matters when it is not zero.
+        print(f"  pages visited      {stats.pages_visited}")
+        if stats.browser_errors:
+            print(f"  browser errors     {stats.browser_errors}")
+        if stats.selector_failures:
+            print(f"  selector failures  {stats.selector_failures}")
+        if stats.auth_failures:
+            print(f"  auth failures      {stats.auth_failures}")
+
     if stats.per_validation_reason:
         print("\n  validation rules:")
         for rule, count in sorted(stats.per_validation_reason.items(), key=lambda kv: -kv[1]):

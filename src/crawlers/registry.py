@@ -53,9 +53,7 @@ def get_crawler_class(name: str) -> type[BaseCrawler]:
     return _REGISTRY[slug]
 
 
-def build_crawler(
-    name: str, settings: Settings, *, browser: Any = None
-) -> BaseCrawler:
+def build_crawler(name: str, settings: Settings, *, browser: Any = None) -> BaseCrawler:
     """Instantiate the crawler registered under ``name``.
 
     ``browser`` optionally injects a :class:`~src.browser.session.BrowserManager`.
@@ -68,8 +66,12 @@ def build_crawler(
         ConfigError: if the source needs credentials that are not configured.
     """
     cls = get_crawler_class(name)
-    accepts_browser = issubclass(cls, BrowserCrawler)
-    crawler = cls(settings, browser=browser) if accepts_browser else cls(settings)
+    # Type-tested, not assumed: a source that needs no browser must keep the
+    # one-argument constructor it has always had, so ``browser=`` is passed only
+    # to the subclasses that declare the parameter.
+    crawler: BaseCrawler = (
+        cls(settings, browser=browser) if issubclass(cls, BrowserCrawler) else cls(settings)
+    )
     ok, reason = crawler.is_available()
     if not ok:
         raise ConfigError(f"source {crawler.provider!r} is not usable: {reason}")
