@@ -23,12 +23,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from src.profile_loader import load_named_profiles
 from src.utils.errors import ConfigError
 from src.utils.names import profile_key
 from src.utils.numbers import parse_employee_range
-from src.utils.yaml_load import load_yaml_mapping
 
 #: Profile used by a bare ``--search-profile`` with no name.
 DEFAULT_PROFILE_NAME = "default"
@@ -160,32 +160,13 @@ def load_search_profiles(path: str | Path | None = None) -> dict[str, SearchProf
             of names to profiles, contains a profile that fails validation, or
             defines two names that differ only in punctuation.
     """
-    resolved = Path(path) if path is not None else DEFAULT_PROFILES_PATH
-    document = load_yaml_mapping(
-        resolved, label="search profiles", env_var="LEAD_SEARCH_PROFILES_PATH"
+    return load_named_profiles(
+        SearchProfile,
+        path,
+        default_path=DEFAULT_PROFILES_PATH,
+        label="search profiles",
+        env_var="LEAD_SEARCH_PROFILES_PATH",
     )
-
-    profiles: dict[str, SearchProfile] = {}
-    spellings: dict[str, str] = {}
-    for raw_name, raw_profile in document.items():
-        name = str(raw_name).strip()
-        if not name:
-            raise ConfigError(f"{resolved} has a profile with an empty name")
-        key = profile_key(name)
-        if key in spellings:
-            # `singapore_tech` and `singapore-tech` are the same key, so the
-            # second would silently replace the first — the exact failure this
-            # module exists to prevent in the other direction.
-            raise ConfigError(
-                f"{resolved} defines both {spellings[key]!r} and {name!r}, which "
-                f"differ only in punctuation; rename one of them"
-            )
-        spellings[key] = name
-        try:
-            profiles[key] = SearchProfile.model_validate(raw_profile or {})
-        except ValidationError as exc:
-            raise ConfigError(f"profile {name!r} in {resolved} is invalid: {_format(exc)}") from exc
-    return profiles
 
 
 def get_search_profile(name: str | None, *, path: str | Path | None = None) -> SearchProfile | None:
@@ -210,11 +191,3 @@ def get_search_profile(name: str | None, *, path: str | Path | None = None) -> S
         known = ", ".join(sorted(profiles)) or "<none>"
         raise ConfigError(f"unknown search profile {name!r}; available profiles: {known}")
     return profiles[key]
-
-
-def _format(error: ValidationError) -> str:
-    """Render a pydantic error as ``field: message`` pairs for a CLI."""
-    return "; ".join(
-        f"{'.'.join(str(part) for part in item['loc']) or '<profile>'}: {item['msg']}"
-        for item in error.errors()
-    )

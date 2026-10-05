@@ -67,11 +67,6 @@ class ResolvedProfile:
             found.append(FILTER_HALF)
         return tuple(found)
 
-    @property
-    def is_empty(self) -> bool:
-        """True when the name resolved to nothing at all — never returned today."""
-        return not self.defined_halves
-
 
 def profile_names(
     *,

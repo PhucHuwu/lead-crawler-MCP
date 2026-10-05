@@ -20,7 +20,7 @@ import logging
 import sys
 import traceback
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from src.utils.redaction import redact
 
@@ -91,13 +91,21 @@ class SecretRedactingFilter(logging.Filter):
             if key.startswith("_"):
                 continue
             setattr(record, key, redact(record.__dict__[key]))
-        if record.exc_info is not None and not record.exc_text:
-            record.exc_text = redact(_render_exception(record.exc_info))
+        if record.exc_info and not record.exc_text:
+            record.exc_text = cast("str", redact(_render_exception(record.exc_info)))
         return True
 
     @staticmethod
-    def _redact_args(args: object) -> object:
-        """Redact ``args``, which logging accepts as a tuple or a mapping."""
+    def _redact_args(args: Any) -> Any:
+        """Redact ``args``, which logging accepts as a tuple, a mapping, or a
+        single value.
+
+        Typed loosely on purpose: ``LogRecord.args`` is only *declared* as a
+        tuple or mapping, but a one-argument call (``logger.info("%s", x)``)
+        leaves the bare value there, and that is exactly the case where the
+        secret is the whole of ``args``. Narrowing the type would silently skip
+        it.
+        """
         if isinstance(args, dict):
             return {key: redact(value) for key, value in args.items()}
         if isinstance(args, tuple):
@@ -106,7 +114,18 @@ class SecretRedactingFilter(logging.Filter):
 
 
 def _render_exception(exc_info: Any) -> str:
-    """Render ``exc_info`` the way :mod:`logging` would, for the filter to scrub."""
+    """Render ``exc_info`` the way :mod:`logging` would, for the filter to scrub.
+
+    ``logging`` normalises ``exc_info`` before the record is built, but only when
+    it is truthy — ``exc_info=False`` reaches the record as ``False`` (the
+    pipeline passes a computed boolean), and an exception instance is also
+    accepted. Both are handled here rather than assumed away, because a filter
+    that raises takes the whole log line with it.
+    """
+    if exc_info is True:  # the caller meant "the exception being handled now"
+        exc_info = sys.exc_info()
+    elif isinstance(exc_info, BaseException):
+        exc_info = (type(exc_info), exc_info, exc_info.__traceback__)
     kind, value, tb = exc_info
     return "".join(traceback.format_exception(kind, value, tb))
 

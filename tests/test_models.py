@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import UTC, datetime
 
 import pytest
@@ -17,6 +18,7 @@ from src.models.lead import (
 )
 from src.models.results import CrawlStats
 from tests.conftest import make_lead, make_raw_lead
+from tests.fixtures.records import INTERNATIONAL_NAMES, VIETNAMESE_NAMES
 
 
 class TestLeadId:
@@ -122,6 +124,100 @@ class TestIdentityKeys:
         assert keys["name_domain"] == "adaoneill@acme.com"
 
 
+class TestSlugifyIdentity:
+    """The name slug, which is the basis of every inferred identity key.
+
+    This function is lossy in two directions, and both are deliberate: it must
+    discard differences that do not distinguish people (case, punctuation,
+    spacing, diacritics, the stroke on ``đ``) and keep every difference that
+    does. A slug that folds too much merges two people; a slug that folds too
+    little splits one. An *empty* slug does something worse than either — it
+    removes the key entirely, so the record cannot be matched at all.
+    """
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            ("Nguyễn Văn An", "Nguyen Van An"),
+            ("Nguyễn Văn An", "NGUYỄN VĂN AN"),
+            ("Đặng Thu Hà", "Dang Thu Ha"),
+            ("José Álvarez", "Jose Alvarez"),
+            ("Ada O'Neill", "ada oneill"),
+            ("Ada  Lovelace", "AdaLovelace"),
+            ("Võ Thị Hồng", "Vo Thi Hong"),
+        ],
+    )
+    def test_spellings_of_one_name_reach_one_slug(self, left: str, right: str) -> None:
+        assert slugify_identity(left) == slugify_identity(right)
+        assert slugify_identity(left) != ""
+
+    @pytest.mark.parametrize(
+        "name", (*VIETNAMESE_NAMES, *(name for name, _ in INTERNATIONAL_NAMES))
+    )
+    def test_composed_and_decomposed_forms_agree(self, name: str) -> None:
+        # Built with unicodedata rather than written out: hand-typed combining
+        # sequences are nearly impossible to get right, and a wrong one would
+        # make the test pass while proving nothing.
+        composed = unicodedata.normalize("NFC", name)
+        decomposed = unicodedata.normalize("NFD", name)
+        assert slugify_identity(composed) == slugify_identity(decomposed)
+        assert slugify_identity(composed) != ""
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Ada Lovelace",
+            "Nguyễn Văn An",
+            "Ольга Иванова",
+            "Μαρία Παπαδοπούλου",
+            "محمد الأحمد",
+            "김민준",
+            "山田太郎",
+            "สมชาย ใจดี",
+            "José Álvarez",
+        ],
+    )
+    def test_no_script_slugs_to_nothing(self, name: str) -> None:
+        # The regression this guards: a `[^a-z0-9]` strip erased every
+        # non-Latin script, so a Cyrillic or Korean lead with no email had no
+        # identity keys at all and could not be merged even with an exact copy
+        # of itself.
+        assert slugify_identity(name) != ""
+
+    @pytest.mark.parametrize(
+        ("left", "right"),
+        [
+            ("Ada Lovelace", "Grace Hopper"),
+            ("김민준", "김지훈"),
+            ("Nguyễn Văn An", "Nguyễn Văn Bình"),
+            ("Ольга Иванова", "Мария Иванова"),
+            ("สมชาย ใจดี", "สมหญิง ใจดี"),
+        ],
+    )
+    def test_different_names_reach_different_slugs(self, left: str, right: str) -> None:
+        # The opposite failure: a fold aggressive enough to map everything to
+        # the same value would merge unrelated people unconditionally.
+        assert slugify_identity(left) != slugify_identity(right)
+
+    def test_returns_empty_only_for_absent_input(self) -> None:
+        assert slugify_identity(None) == ""
+        assert slugify_identity("") == ""
+
+    def test_a_punctuation_only_name_slugs_to_nothing(self) -> None:
+        # Documented consequence: identity_keys omits keys built from an empty
+        # slug, so a name of pure punctuation simply contributes no name key.
+        assert slugify_identity("!!!") == ""
+
+    def test_punctuation_and_spacing_are_dropped_not_replaced(self) -> None:
+        # Consecutive separators must collapse without leaving an artefact —
+        # the slug is embedded in a key, so "_" or "-" would become part of the
+        # matched value.
+        assert slugify_identity("Ada  O'Neill-Smith") == "adaoneillsmith"
+
+    def test_the_result_is_stable_across_calls(self) -> None:
+        assert slugify_identity("Nguyễn Văn An") == slugify_identity("Nguyễn Văn An")
+
+
 class TestFlatten:
     def test_columns_match_csv_exporter(self) -> None:
         # The CSV header is declared separately so empty results still get one;
@@ -198,6 +294,58 @@ class TestRawLead:
     ) -> None:
         lead = make_raw_lead(**raw)
         assert lead.label() == expected
+
+
+class TestRawLeadSeniority:
+    """``seniority`` arrives in each source's own vocabulary, not ours.
+
+    A source that supplies a value our enum does not know must not be able to
+    fail validation: the field is optional metadata, and rejecting the record
+    over it would drop an otherwise-perfect lead. Apollo in particular searches
+    on ``head``, which is a level our enum folds into ``director``.
+    """
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            # Apollo's own vocabulary, including the levels we do not model.
+            ("head", SeniorityLevel.DIRECTOR),
+            ("owner", SeniorityLevel.FOUNDER),
+            ("partner", SeniorityLevel.FOUNDER),
+            ("c_suite", SeniorityLevel.C_SUITE),
+            ("vp", SeniorityLevel.VP),
+            # Case, spacing and hyphens are forgiven.
+            ("  Head  ", SeniorityLevel.DIRECTOR),
+            ("C-Suite", SeniorityLevel.C_SUITE),
+            ("Vice President", SeniorityLevel.VP),
+            ("VP", SeniorityLevel.VP),
+            # Our own field name spelling for a member that is also a value.
+            ("UNKNOWN", SeniorityLevel.UNKNOWN),
+        ],
+    )
+    def test_accepts_vendor_vocabulary_and_normalizes_it(
+        self, raw: str, expected: SeniorityLevel
+    ) -> None:
+        assert make_raw_lead(seniority=raw).seniority is expected
+
+    def test_an_enum_member_passes_through_unchanged(self) -> None:
+        assert make_raw_lead(seniority=SeniorityLevel.MANAGER).seniority is SeniorityLevel.MANAGER
+
+    def test_unrecognizable_text_becomes_unknown_rather_than_raising(self) -> None:
+        # The normalizer already decides what unknown seniority means; the model
+        # only has to refuse to be the thing that kills the record.
+        assert make_raw_lead(seniority="Chief Vibes Officer").seniority is SeniorityLevel.UNKNOWN
+
+    def test_absent_and_blank_stay_absent(self) -> None:
+        # ``None`` is "the source said nothing", which is not the same claim as
+        # "the source said something we could not read".
+        assert make_raw_lead(seniority=None).seniority is None
+        assert make_raw_lead().seniority is None
+
+    def test_a_non_string_scalar_is_not_a_validation_error(self) -> None:
+        # Defensive: a source that emits a number here should cost us the field,
+        # not the record.
+        assert make_raw_lead(seniority=42).seniority is SeniorityLevel.UNKNOWN
 
 
 class TestCrawlStats:

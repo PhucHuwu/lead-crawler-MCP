@@ -1,21 +1,100 @@
 # Lead Crawler
 
-**Tinasoft — Phase 1.** A standalone command-line application that collects B2B
-lead records from one or more sources, normalizes and validates them, applies
-opt-in qualification filters, collapses duplicates, and exports a standardized
-lead set as CSV / JSON / JSONL.
+**Tinasoft — Phase 1: Standalone Lead Crawler.** A command-line application that
+collects B2B lead records from one or more sources, normalizes and validates
+them, applies opt-in qualification filters, collapses duplicates, and exports a
+standardized lead set as CSV / JSON / JSONL.
 
 Phase 1 deliberately does one thing: turn messy source records into a clean,
-de-duplicated, exportable lead file. Everything else — scheduling, outreach, CRM
-sync — is out of scope and lives in later phases.
+de-duplicated, exportable lead file. It runs when you invoke it and exits — there
+is no scheduler, no daemon, no database, and no outbound contact of any kind. See
+[Phase boundaries](#phase-boundaries) for what that rules out, and where each
+excluded capability is expected to land.
 
-```text
-Data source → Crawler adapter → RawLead → Normalize → Validate → Filter → Deduplicate → StandardizedLead → CSV/JSON/JSONL
-```
+## Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Installation](#installation)
+- [Configuration](#configuration)
+- [Usage](#usage)
+- [Output](#output)
+- [Failure handling](#failure-handling)
+- [Environment variables](#environment-variables)
+- [The processing layer](#the-processing-layer)
+- [Adding a new crawler](#adding-a-new-crawler)
+- [Testing](#testing)
+- [Phase boundaries](#phase-boundaries)
+- [Known limitations](#known-limitations)
+- [Recommended next steps](#recommended-next-steps)
 
 ---
 
-## Quick start
+## Overview
+
+Every B2B lead list starts as something you cannot use directly: an Apollo
+people-search response, a vendor CSV with four different spellings of "United
+States", or a company homepage. The crawler exists to turn any of those into one
+schema, once, so that everything downstream — a spreadsheet, a CRM import, a
+later phase's enrichment pass — reads the same shape.
+
+It does that in one command:
+
+```bash
+python -m src.main --source apollo --profile singapore_tech --limit 300 --format csv
+```
+
+What happens between that command and the file on disk:
+
+| Stage | What it decides |
+| ----- | --------------- |
+| **Collection** | Fetch records from each requested source, concurrently and independently |
+| **Normalization** | `usa` → `US`, `https://www.Acme.com/x` → `acme.com`, `ADA` → `Ada` |
+| **Validation** | Drop records with no usable identity; *flag* — never drop — the merely imperfect |
+| **Filtering** | Apply whatever qualification rules you opted into (off by default) |
+| **Deduplication** | Collapse the same person seen through two sources, on an identity ladder |
+| **Export** | Write CSV / JSON / JSONL atomically, plus a run report explaining the run |
+
+Three properties are worth stating up front, because they shape almost every
+design decision that follows:
+
+- **A bad record costs that record, nothing more.** A broken row, a broken page
+  and a broken source are each contained at their own level, and every dropped
+  lead is attributed to the stage that dropped it, with a reason.
+- **Nothing is silent.** Filtering is opt-in, deduplication reports how many
+  merges were *proof* versus *inference*, and the run report is designed to be
+  attached to a ticket when a run returns fewer leads than expected.
+- **Credentials never leave the environment.** No API key is hardcoded, no key is
+  logged, and `config/*.yaml` holds behaviour only.
+
+---
+
+## Architecture
+
+### The pipeline
+
+```text
+Source → Crawler adapter → RawLead → Normalize → Validate → Filter → Deduplicate → StandardizedLead → Export
+         (crawlers/)                  └────────────── processors/ ──────────────┘                    (exporters/)
+```
+
+Seven stages, and only the first and last are source-specific:
+
+| # | Stage | Where | In → out |
+| - | ----- | ----- | -------- |
+| 1 | Source | a file, an HTTP API, a public website | — |
+| 2 | Crawler adapter | `src/crawlers/` | source payload → `RawLead` |
+| 3 | Normalization | `src/processors/normalizer.py` | `RawLead` → canonical values |
+| 4 | Validation | `src/processors/validator.py` | reject or flag each record |
+| 5 | Filtering | `src/processors/filters.py` | keep / drop against opt-in rules |
+| 6 | Deduplication | `src/processors/deduplicator.py` | collapse on an identity ladder |
+| 7 | Export | `src/exporters/` | `StandardizedLead` → CSV / JSON / JSONL + report |
+
+Stages 3–6 are shared by every source and are reached only through
+`src/processors/pipeline.py`. That is what makes [adding a crawler](#adding-a-new-crawler)
+a one-module change.
+
+`src/`
 
 Requires **Python 3.11+**. The project was developed against CPython 3.13 and a
 `uv.lock` is committed.
@@ -330,10 +409,51 @@ than you expected. It and `--log-level` are mutually exclusive.
 | Code | Meaning |
 | ---- | ------- |
 | 0 | Run completed (the result set may still be empty) |
-| 1 | Unexpected internal failure |
-| 2 | Configuration error (bad flag, unknown source, missing credentials) |
+| 1 | Unexpected internal failure, or a file that could not be written |
+| 2 | Configuration error (bad flag, unknown source, missing credentials, unwritable destination) |
 | 3 | Every requested source failed |
 | 4 | `--fail-on-empty` was set and no leads were produced |
+| 130 | Interrupted with `Ctrl+C` |
+
+### When something goes wrong
+
+A run is built to fail in the smallest unit it can: a bad record costs that
+record, a bad page costs that page, a bad source costs that source, and only a
+bad *invocation* costs the run.
+
+- **A record that cannot be read is skipped, not fatal.** A source's payload is
+  untrusted, so a record that will not map is dropped on its own — the rest of
+  the page still lands. Each one logs a `could not map …` warning carrying the
+  record's id (or its position), the error, and a bounded excerpt of the record,
+  and the source's closing line counts them: `collected leads from apollo
+  count=48 requested=50 unmappable=2`. Nothing here needs `--verbose`.
+- **A malformed CSV row stops the read and keeps everything before it.** The
+  `csv` module raises from the middle of a stream and cannot resume, so the
+  alternative is discarding a whole export over one pathological cell. The
+  warning names the line number to go and look at.
+- **A source that fails is contained.** Its error is recorded against that
+  provider and the other sources carry on; only *every* requested source failing
+  returns exit 3.
+- **Retries are for transient failures only.** Timeouts, `429` and `5xx` are
+  retried with exponential backoff, honouring `Retry-After` up to
+  `LEAD_HTTP_MAX_ATTEMPTS`. `401`/`403` and other permanent `4xx` are not —
+  retrying a rejected key only delays the error, and a malformed request will not
+  fix itself.
+- **An unwritable destination is rejected before the crawl.** For a metered
+  source that is the difference between a failed command and a failed command
+  that also cost money. `--dry-run` creates nothing at all.
+- **One format failing to write does not cost the others, or the run report.**
+  The crawl is the expensive part and the report is what explains it, so both
+  survive an unwritable file; the first failure is still re-raised so the exit
+  code says the run did not fully succeed.
+- **Credentials never reach the log.** Every log record — message, arguments,
+  `extra` fields and tracebacks — is passed through a redaction filter before it
+  is rendered, and the values it removes are collected from the settings model's
+  `SecretStr` fields rather than from a hand-maintained list. A withheld value
+  appears as `***`, so a redaction is never mistaken for an empty field.
+- **`Ctrl+C` exits 130.** The event loop is cancelled, every crawler's buffers
+  and connection pool are closed on the way out, and the process does not hang
+  waiting on an in-flight request.
 
 Discoverability: `--list-sources`, `--list-formats`, `--list-profiles` and
 `--list-filter-profiles`. Each prints what is available and exits 0 without
@@ -879,7 +999,7 @@ filters and deduplicator apply unchanged.
 ## Tests
 
 ```bash
-pytest                      # 714 tests
+pytest                      # 858 tests
 pytest tests/test_cli.py -v # one module
 pytest -k dedup             # by name
 
@@ -988,6 +1108,24 @@ Phase 1 is deliberately narrow. What it does **not** do:
   handles country codes and the common punctuation real exports contain, but a
   number without a country code and without `LEAD`-level context stays ambiguous.
 - **CSV only for local files** — no XLSX, no Google Sheets.
+- **A CSV read stops at the first `csv.Error`.** The rows before it are kept and
+  the line number is logged, but the `csv` module cannot resume mid-stream, so a
+  second malformed cell later in the same file is not reached. Fixing the first
+  one and re-running is the recovery path.
+- **Log redaction is value-based, not structural.** It removes the exact
+  credential strings the process holds — collected from the settings model's
+  `SecretStr` fields — so a *derived* form (a hash, a base64 encoding, the last
+  four characters) would not be caught. A source that signs requests, rather than
+  sending a bare key, is the reason to revisit this.
+- **The retry budget is per-request, not per-run.** A run where several sources
+  are each retrying up to `LEAD_HTTP_MAX_ATTEMPTS` can therefore take noticeably
+  longer than its lead count suggests; the backoff is bounded and honoured
+  `Retry-After` is capped, but there is no overall run deadline.
+- **A record-skipping warning is not a sampling decision.** Every unmappable
+  record produces one, so a source that is systematically broken on one field
+  will emit a warning per record. That is the correct default for a tool whose
+  output is a lead list, but it means `--log-level WARNING` can be noisy against
+  a badly-shaped export.
 - **Everything is single-process and in-memory.** Fine at tens of thousands of
   leads; there is no streaming path for millions.
 - **No persistence.** Each run is independent; there is no state between runs, by

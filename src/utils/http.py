@@ -8,7 +8,6 @@ retry behaviour identical across every source and makes it testable in one place
 
 from __future__ import annotations
 
-import logging
 import random
 from dataclasses import dataclass, field
 from typing import Any, Self
@@ -23,8 +22,9 @@ from src.utils.errors import (
     SourceRateLimitError,
     SourceUnavailableError,
 )
+from src.utils.logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 #: Statuses worth retrying: transient server-side or throttling responses.
 RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
@@ -215,9 +215,6 @@ class AsyncHttpClient:
                 self.provider,
                 f"{method} {url} returned a non-JSON body: {_safe_snippet(response)}",
             ) from exc
-
-    async def get_json(self, url: str, **kwargs: Any) -> Any:
-        return await self.request_json("GET", url, **kwargs)
 
     async def post_json(self, url: str, **kwargs: Any) -> Any:
         return await self.request_json("POST", url, **kwargs)

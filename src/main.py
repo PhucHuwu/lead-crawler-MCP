@@ -40,6 +40,7 @@ from src.filter_profiles import (
 from src.models.enums import DedupStrategy, LogFormat
 from src.profiles import HALVES, profile_names, resolve_profile
 from src.utils.errors import ConfigError, ExportError, LeadCrawlerError
+from src.utils.io import ensure_directory
 from src.utils.logging import configure_logging, get_logger
 from src.utils.time import utcnow
 
@@ -644,8 +645,10 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
     crawlers = [build_crawler(name, settings) for name in requested]
     limit = args.limit or settings.default_limit
 
-    # Fail on a contradictory output request before paying for the crawl.
-    _check_output_target(args, settings)
+    # Fail on a contradictory or unwritable output request before paying for the
+    # crawl — the crawl is the expensive half and, for a metered source, the
+    # half that costs money.
+    _check_output_target(args, settings, dry_run=args.dry_run)
 
     # At DEBUG only: which flags and environment values actually won. This is the
     # first thing to look at when a run behaves unlike the command line suggests,
@@ -702,25 +705,51 @@ async def _run(args: argparse.Namespace, settings: Settings) -> int:
     return EXIT_OK
 
 
-def _check_output_target(args: argparse.Namespace, settings: Settings) -> None:
-    """Reject an ``--output`` target that cannot hold what was requested.
+def _check_output_target(
+    args: argparse.Namespace, settings: Settings, *, dry_run: bool = False
+) -> None:
+    """Reject an output request that cannot succeed, before any crawling.
 
-    An explicit path names exactly one file, so it can carry exactly one format.
-    Checked before any crawling so a contradictory invocation fails immediately
-    rather than after paying for the whole run.
+    Three things are checked, and all of them are cheap and better known early:
+
+    * ``--output`` names exactly one file, so it can carry exactly one format.
+    * The destination directory exists or can be created.
+    * That directory is the parent of ``--output``, or the run's output
+      directory.
+
+    Checked before the crawl so a contradictory or unwritable invocation fails
+    immediately. Discovering it afterwards is not merely slow: for a metered
+    source such as Apollo it means paying for a crawl whose results have
+    nowhere to go.
+
+    Args:
+        args: Parsed CLI arguments.
+        settings: Effective settings, for the output directory and formats.
+        dry_run: When True nothing will be written, so the directory is left
+            alone — a dry run must not create directories as a side effect.
 
     Raises:
-        ConfigError: if ``--output`` was given alongside several formats.
+        ConfigError: if the request cannot be satisfied.
     """
-    if args.output is None:
+    if args.output is not None:
+        formats = settings.active_formats()
+        if len(formats) > 1:
+            requested = ", ".join(fmt.value for fmt in formats)
+            raise ConfigError(
+                f"--output writes a single file, but {len(formats)} formats were "
+                f"requested ({requested}); pass one --format or use --output-dir"
+            )
+
+    if dry_run:
         return
-    formats = settings.active_formats()
-    if len(formats) > 1:
-        requested = ", ".join(fmt.value for fmt in formats)
-        raise ConfigError(
-            f"--output writes a single file, but {len(formats)} formats were "
-            f"requested ({requested}); pass one --format or use --output-dir"
-        )
+
+    if args.output is None:
+        settings.ensure_output_dir()
+        return
+
+    # An explicit --output creates its parent the same way --output-dir creates
+    # its own, so `--output build/leads.csv` works from a clean checkout.
+    ensure_directory(args.output.parent, what="output directory")
 
 
 async def _export(
@@ -744,6 +773,16 @@ async def _export(
     ``sources`` is the set of providers the run requested — passed in rather than
     read off the result, because a source that failed returned no counts yet
     still belongs in the name of the run that asked for it.
+
+    A format that cannot be written does not cost the others, and does not cost
+    the report: all three are attempted, every failure is logged as it happens,
+    and the first one is re-raised at the end so the exit code still says the
+    run did not fully succeed. The crawl behind this is the expensive part and
+    the report is what explains it, so throwing either away over one unwritable
+    file would be the wrong trade.
+
+    Raises:
+        ExportError: if any format or the run report could not be written.
     """
     from src.exporters import build_exporter, source_slug, write_run_report
 
@@ -752,6 +791,7 @@ async def _export(
     logger = get_logger("main")
     formats = settings.active_formats()
     outputs: list[Path] = []
+    failures: list[ExportError] = []
     # UTC, matching every other timestamp the tool emits: the filename, the
     # report and the log lines then order the same way without a zone puzzle.
     timestamp = utcnow().strftime("%Y-%m-%d_%H-%M-%S")
@@ -767,9 +807,19 @@ async def _export(
         report_path = directory / f"{settings.output_prefix}_{slug}_{timestamp}_report.json"
 
     for fmt in formats:
+        # Outside the try: an unregistered format is a programming error, and
+        # swallowing it here would report it as a filesystem problem.
         exporter = build_exporter(fmt, settings)
         path = fixed_path or exporter.build_path(directory, settings.output_prefix, slug, timestamp)
-        export_result = await exporter.export(result.leads, path)
+        try:
+            export_result = await exporter.export(result.leads, path)
+        except ExportError as exc:
+            failures.append(exc)
+            logger.error(
+                "export failed",
+                extra={"format": fmt.value, "path": str(path), "error": str(exc)},
+            )
+            continue
         outputs.append(export_result.path)
         result.stats.output_files.append(str(export_result.path))
         logger.info(
@@ -783,10 +833,16 @@ async def _export(
         )
 
     if settings.write_run_report:
-        outputs.append(
-            await write_run_report(result, report_path, settings, limit=limit, sources=sources)
-        )
+        try:
+            outputs.append(
+                await write_run_report(result, report_path, settings, limit=limit, sources=sources)
+            )
+        except ExportError as exc:
+            failures.append(exc)
+            logger.error("run report failed", extra={"path": str(report_path), "error": str(exc)})
 
+    if failures:
+        raise failures[0]
     return outputs
 
 

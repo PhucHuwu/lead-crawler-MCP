@@ -46,6 +46,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from src.models.enums import DedupStrategy, ExportFormat, LogFormat, SeniorityLevel
 from src.models.lead import is_lead_field_path
 from src.utils.errors import ConfigError
+from src.utils.io import ensure_directory
 from src.utils.numbers import parse_employee_range
 from src.utils.redaction import iter_secret_values, register_secrets
 
@@ -453,13 +454,7 @@ class Settings(BaseSettings):
         Raises:
             ConfigError: if the directory cannot be created or written to.
         """
-        try:
-            self.output_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise ConfigError(f"cannot create output directory {self.output_dir}: {exc}") from exc
-        if not self.output_dir.is_dir():
-            raise ConfigError(f"output path {self.output_dir} exists but is not a directory")
-        return self.output_dir
+        return ensure_directory(self.output_dir, what="output directory")
 
     def active_formats(self) -> list[ExportFormat]:
         """Requested export formats, de-duplicated, order preserved."""

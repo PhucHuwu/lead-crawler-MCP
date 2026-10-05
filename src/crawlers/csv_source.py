@@ -20,9 +20,11 @@ from typing import TYPE_CHECKING, Any
 from src.crawlers.base import BaseCrawler
 from src.crawlers.registry import register_crawler
 from src.models.lead import RawLead
-from src.utils.errors import SourceNotFoundError
+from src.utils.errors import CrawlerError, SourceNotFoundError
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from src.config import Settings
 
 _HEADER_SANITIZE_RE = re.compile(r"[^a-z0-9]+")
@@ -143,10 +145,6 @@ class CsvCrawler(BaseCrawler):
             return False, f"not a file: {self._path}"
         return True, ""
 
-    def set_path(self, path: Path) -> None:
-        """Point the crawler at a file, used by the CLI's ``--csv-path`` flag."""
-        self._path = path
-
     async def crawl(self, limit: int) -> list[RawLead]:
         if self._path is None:
             raise SourceNotFoundError(self.provider, "no CSV path configured")
@@ -194,6 +192,11 @@ class CsvCrawler(BaseCrawler):
                 f"{path} is not valid {encoding}; set LEAD_CSV_SOURCE__ENCODING "
                 f"(e.g. latin-1) to match the file",
             ) from exc
+        except OSError as exc:
+            # is_available() checks the file exists, so a failure here is a
+            # permission or device problem rather than a missing path. Named
+            # with the path so the operator knows which file to look at.
+            raise CrawlerError(self.provider, f"cannot read {path}: {exc}") from exc
 
     def _resolve_delimiter(self, sample: str, configured: str, path: Path) -> str:
         if configured.casefold() != "auto":
@@ -227,14 +230,52 @@ class CsvCrawler(BaseCrawler):
                 extra={"headers": list(reader.fieldnames)},
             )
 
-        leads: list[RawLead] = []
-        for row_number, row in enumerate(reader, start=2):  # row 1 is the header
-            if len(leads) >= limit:
-                break
-            lead = self._row_to_lead(row, column_targets, row_number)
-            if lead is not None:
-                leads.append(lead)
+        rows = self._numbered_rows(reader)
+        leads, unmappable = self.map_records(
+            rows,
+            lambda item: self._row_to_lead(item[1], column_targets, item[0]),
+            kind="csv row",
+            label=lambda item: f"row {item[0]}",
+            limit=limit,
+        )
+        if unmappable:
+            self.logger.warning(
+                "skipped unreadable csv rows",
+                extra={"path": str(self._path), "rows": unmappable},
+            )
         return leads
+
+    def _numbered_rows(self, reader: Any) -> Iterator[tuple[int, dict[str, Any]]]:
+        """Data rows paired with their line number, read lazily.
+
+        Reading stops at the underlying reader's end or at the first
+        :exc:`csv.Error`, which the csv module raises from the middle of the
+        stream (a field over its size limit, a stray quote) and from which it
+        cannot resume. A file that trips that is still worth every row before
+        the break: a 50 000-row export with one pathological cell should yield
+        49 999 leads and a warning, not nothing at all.
+
+        Lazy so that the caller's row limit — which counts *leads*, and a blank
+        row is not one — stops the read rather than being applied afterwards to
+        a file already held in memory.
+        """
+        # Row 1 is the header, so the first data row is 2. Counted here rather
+        # than by `enumerate` so that when `__next__` is what raised, the number
+        # still points at the row that broke rather than the one before it.
+        row_number = 1
+        try:
+            for row in reader:
+                row_number += 1
+                yield row_number, row
+        except csv.Error as exc:
+            self.logger.warning(
+                "stopped reading csv at a malformed row",
+                extra={
+                    "path": str(self._path),
+                    "row": row_number + 1,
+                    "error": str(exc),
+                },
+            )
 
     def _row_to_lead(
         self, row: dict[str, Any], column_targets: dict[str, str], row_number: int

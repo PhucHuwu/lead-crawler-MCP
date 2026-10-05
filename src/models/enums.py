@@ -88,9 +88,11 @@ class ValidationSeverity(StrEnum):
 class DedupStrategy(StrEnum):
     """How aggressively duplicate leads are collapsed.
 
-    Each strategy is a prefix of a shared, ordered ladder of identity keys
-    (strongest first): ``email`` -> ``linkedin`` -> ``phone_name`` ->
-    ``name_domain`` -> ``name_company`` -> ``lastname_domain``.
+    Each strategy is a prefix of a shared, ordered ladder of identity keys,
+    strongest first: ``source_id`` -> ``email`` -> ``linkedin`` -> ``phone_name``
+    -> ``name_domain`` -> ``name_company``. The ladder itself lives in
+    :data:`src.processors.deduplicator._STRATEGY_KEYS`; this enum only names how
+    far down it a run is allowed to look.
     """
 
     #: Keep everything.
@@ -99,7 +101,7 @@ class DedupStrategy(StrEnum):
     EMAIL = "email"
     #: Email, LinkedIn URL, or phone+name. Safe default for mixed sources.
     IDENTITY = "identity"
-    #: The above plus name+company-domain and last-name+domain. Highest recall,
+    #: The above plus name+company-domain and name+company. Highest recall,
     #: some risk of merging two distinct people at the same company.
     AGGRESSIVE = "aggressive"
 

@@ -49,7 +49,6 @@ class TestResolving:
         assert resolved.filters is not None
         assert resolved.filters.allowed_titles == ["CTO"]
         assert resolved.defined_halves == (SEARCH_HALF, FILTER_HALF)
-        assert not resolved.is_empty
 
     def test_a_name_in_one_file_resolves_that_half_only(self, tmp_path: Path) -> None:
         # A strategy that only narrows the search is still a strategy. The
@@ -58,7 +57,6 @@ class TestResolving:
         resolved = resolve_profile("search_only", search_path=search_path, filter_path=filter_path)
         assert resolved.defined_halves == (SEARCH_HALF,)
         assert resolved.filters is None
-        assert not resolved.is_empty
 
     def test_the_other_half_only_also_resolves(self, tmp_path: Path) -> None:
         search_path, filter_path = write_pair(tmp_path, SEARCH_BODY, FILTER_BODY)

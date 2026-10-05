@@ -111,6 +111,7 @@ class BaseCrawler(ABC):
         *,
         kind: str = "record",
         label: Callable[[Any], str] | None = None,
+        limit: int | None = None,
     ) -> tuple[list[RawLead], int]:
         """Turn a source's records into leads, containing any that fail.
 
@@ -125,7 +126,8 @@ class BaseCrawler(ABC):
         cannot be forgotten when the next source is added.
 
         Args:
-            records: Raw source records, in source order.
+            records: Raw source records, in source order. Consumed lazily, so a
+                generator that reads from a file is left unread past ``limit``.
             mapper: Turns one record into a :class:`RawLead`. Returning ``None``
                 means "there was nothing to map here" — a blank CSV row — and is
                 not a failure.
@@ -134,6 +136,9 @@ class BaseCrawler(ABC):
             label: Short identifier for a record, used in the log line. Defaults
                 to the record's position, which is all a source with no stable id
                 can offer.
+            limit: Stop once this many leads have been produced. Counts *leads*,
+                not records, so a source whose pages contain skipped entries is
+                not cut short by them.
 
         Returns:
             ``(leads, failures)`` — the records that mapped, and how many did
@@ -144,6 +149,8 @@ class BaseCrawler(ABC):
         failures = 0
 
         for index, record in enumerate(records):
+            if limit is not None and len(leads) >= limit:
+                break
             try:
                 lead = mapper(record)
             except Exception as exc:

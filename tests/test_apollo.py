@@ -32,6 +32,7 @@ from src.utils.errors import (
     SourceUnavailableError,
 )
 from src.utils.http import MAX_HONORED_RETRY_AFTER, AsyncHttpClient, RetryPolicy, _SourceAwareWait
+from tests.conftest import log_record
 
 BASE_URL = "https://api.apollo.io/api/v1"
 SEARCH_PATH = "/mixed_people/search"
@@ -314,6 +315,117 @@ class TestPagination:
         assert len(route.calls) == 20  # MAX_PAGES
         assert len(leads) == 20
         assert [lead.external_id for lead in leads] == ["1"] * 20
+
+
+class TestRecordContainment:
+    """One unusable person must cost that person, not the page or the run."""
+
+    #: A person whose ``estimated_num_employees`` is an object where a scalar is
+    #: expected. Apollo nests organization data loosely enough that this is a
+    #: real shape, and :class:`RawLead` refuses it — which is the point: the
+    #: refusal has to be contained rather than allowed to unwind ``crawl``.
+    UNMAPPABLE = {
+        "id": "bad-1",
+        "name": "Grace Hopper",
+        "organization": {"estimated_num_employees": {"value": 250}},
+    }
+
+    @respx.mock
+    async def test_a_person_that_cannot_be_mapped_does_not_kill_the_page(
+        self, make_crawler: Callable[..., ApolloCrawler]
+    ) -> None:
+        respx.post(f"{BASE_URL}{SEARCH_PATH}").mock(
+            return_value=httpx.Response(
+                200,
+                json={"people": [{"id": "1", "name": "Ada"}, self.UNMAPPABLE, {"id": "2"}]},
+            )
+        )
+        leads = await make_crawler().crawl(10)
+        assert [lead.external_id for lead in leads] == ["1", "2"]
+
+    @respx.mock
+    async def test_the_failure_is_logged_with_enough_to_find_it(
+        self, make_crawler: Callable[..., ApolloCrawler], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        respx.post(f"{BASE_URL}{SEARCH_PATH}").mock(
+            return_value=httpx.Response(200, json={"people": [self.UNMAPPABLE]})
+        )
+        with caplog.at_level("WARNING", logger="crawlers.apollo"):
+            await make_crawler().crawl(10)
+
+        # The label identifies the record by its most stable field, and the
+        # excerpt carries the payload that caused the refusal.
+        warning = log_record(caplog, "could not map Apollo person; skipping it")
+        assert warning.record == "bad-1"
+        assert "Grace Hopper" in warning.excerpt
+        assert "estimated_num_employees" in warning.excerpt
+        assert warning.error
+
+    @respx.mock
+    async def test_the_excerpt_is_bounded(
+        self, make_crawler: Callable[..., ApolloCrawler], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A pathological record must not turn one warning into a screenful.
+        person = {
+            "id": "big-1",
+            "organization": {"estimated_num_employees": {"value": "x" * 5000}},
+        }
+        respx.post(f"{BASE_URL}{SEARCH_PATH}").mock(
+            return_value=httpx.Response(200, json={"people": [person]})
+        )
+        with caplog.at_level("WARNING", logger="crawlers.apollo"):
+            await make_crawler().crawl(10)
+
+        warning = log_record(caplog, "could not map Apollo person; skipping it")
+        assert len(warning.excerpt) <= 301  # 300 + the ellipsis
+        assert warning.excerpt.endswith("…")
+
+    @respx.mock
+    async def test_an_unidentifiable_person_still_gets_a_label(
+        self, make_crawler: Callable[..., ApolloCrawler], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        respx.post(f"{BASE_URL}{SEARCH_PATH}").mock(
+            return_value=httpx.Response(
+                200, json={"people": [{"organization": {"estimated_num_employees": {"v": 1}}}]}
+            )
+        )
+        with caplog.at_level("WARNING", logger="crawlers.apollo"):
+            assert await make_crawler().crawl(10) == []
+
+        warning = log_record(caplog, "could not map Apollo person; skipping it")
+        assert warning.record == "<unidentified>"
+
+    @respx.mock
+    async def test_the_summary_reports_how_many_were_skipped(
+        self, make_crawler: Callable[..., ApolloCrawler], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # A count is what tells an operator the run was partial *without* reading
+        # every warning line.
+        respx.post(f"{BASE_URL}{SEARCH_PATH}").mock(
+            return_value=httpx.Response(
+                200, json={"people": [{"id": "1"}, self.UNMAPPABLE, self.UNMAPPABLE]}
+            )
+        )
+        with caplog.at_level("INFO", logger="crawlers.apollo"):
+            leads = await make_crawler().crawl(10)
+
+        summary = log_record(caplog, "collected leads from apollo")
+        assert summary.count == 1
+        assert summary.unmappable == 2
+        assert len(leads) == 1
+
+    @respx.mock
+    async def test_a_clean_run_reports_zero_skipped(
+        self, make_crawler: Callable[..., ApolloCrawler], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        respx.post(f"{BASE_URL}{SEARCH_PATH}").mock(
+            return_value=httpx.Response(200, json={"people": [{"id": "1"}]})
+        )
+        with caplog.at_level("INFO", logger="crawlers.apollo"):
+            await make_crawler().crawl(1)
+
+        summary = log_record(caplog, "collected leads from apollo")
+        assert summary.unmappable == 0
 
 
 class TestErrorHandling:

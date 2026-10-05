@@ -41,9 +41,9 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from src.config import FilterSettings
+from src.profile_loader import format_validation_error, load_named_profiles
 from src.utils.errors import ConfigError
 from src.utils.names import profile_key
-from src.utils.yaml_load import load_yaml_mapping
 
 #: Where profiles are read from unless ``LEAD_FILTER_PROFILES_PATH`` says otherwise.
 DEFAULT_PROFILES_PATH = Path("config/filters.yaml")
@@ -149,7 +149,7 @@ class FilterProfile(BaseModel):
         except ValidationError as exc:
             # No "filter profile" prefix here: every caller adds the profile's
             # name, and repeating it reads like two different faults.
-            raise ConfigError(_format(exc)) from exc
+            raise ConfigError(format_validation_error(exc)) from exc
 
 
 def load_filter_profiles(path: str | Path | None = None) -> dict[str, FilterProfile]:
@@ -167,32 +167,13 @@ def load_filter_profiles(path: str | Path | None = None) -> dict[str, FilterProf
             of names to profiles, contains a profile that fails validation, or
             defines two names that differ only in punctuation.
     """
-    resolved = Path(path) if path is not None else DEFAULT_PROFILES_PATH
-    document = load_yaml_mapping(
-        resolved, label="filter profiles", env_var="LEAD_FILTER_PROFILES_PATH"
+    return load_named_profiles(
+        FilterProfile,
+        path,
+        default_path=DEFAULT_PROFILES_PATH,
+        label="filter profiles",
+        env_var="LEAD_FILTER_PROFILES_PATH",
     )
-
-    profiles: dict[str, FilterProfile] = {}
-    spellings: dict[str, str] = {}
-    for raw_name, raw_profile in document.items():
-        name = str(raw_name).strip()
-        if not name:
-            raise ConfigError(f"{resolved} has a profile with an empty name")
-        key = profile_key(name)
-        if key in spellings:
-            # `sea-fintech` and `sea_fintech` are the same key, so the second
-            # would silently replace the first — the exact failure this module
-            # exists to prevent in the other direction.
-            raise ConfigError(
-                f"{resolved} defines both {spellings[key]!r} and {name!r}, which "
-                f"differ only in punctuation; rename one of them"
-            )
-        spellings[key] = name
-        try:
-            profiles[key] = FilterProfile.model_validate(raw_profile or {})
-        except ValidationError as exc:
-            raise ConfigError(f"profile {name!r} in {resolved} is invalid: {_format(exc)}") from exc
-    return profiles
 
 
 def get_filter_profile(name: str | None, *, path: str | Path | None = None) -> FilterProfile | None:
@@ -226,12 +207,3 @@ def get_filter_profile(name: str | None, *, path: str | Path | None = None) -> F
     except ConfigError as exc:
         raise ConfigError(f"filter profile {name!r} is invalid: {exc}") from exc
     return profile
-
-
-def _format(error: ValidationError) -> str:
-    """Render a pydantic error as one readable line for the CLI."""
-    parts = []
-    for issue in error.errors():
-        location = ".".join(str(item) for item in issue["loc"]) or "<root>"
-        parts.append(f"{location}: {issue['msg']}")
-    return "; ".join(parts)

@@ -965,6 +965,216 @@ class TestVerbosity:
         assert secret not in capsys.readouterr().err
 
 
+class TestOutputPreflight:
+    """An output request that cannot succeed fails before the crawl, not after it.
+
+    The crawl is the expensive half of a run and, for a metered source, the half
+    that costs money. Discovering afterwards that there was nowhere to write
+    means paying for results that are then thrown away.
+    """
+
+    def test_an_unwritable_directory_is_a_config_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        blocked = tmp_path / "locked"
+
+        def refuse(self: Path, *args: object, **kwargs: object) -> None:
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(Path, "mkdir", refuse)
+        code = cli(
+            [
+                "--source",
+                "mock",
+                "--limit",
+                "5",
+                "--format",
+                "csv",
+                "--output",
+                str(blocked / "leads.csv"),
+            ]
+        )
+
+        assert code == EXIT_CONFIG
+        err = capsys.readouterr().err
+        assert "cannot create output directory" in err
+        assert str(blocked) in err
+
+    def test_the_check_runs_before_any_crawling(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        def refuse(self: Path, *args: object, **kwargs: object) -> None:
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(Path, "mkdir", refuse)
+        cli(
+            [
+                "--source",
+                "mock",
+                "--limit",
+                "5",
+                "--format",
+                "csv",
+                "--output",
+                str(tmp_path / "x" / "leads.csv"),
+            ]
+        )
+
+        # The pipeline logs this as it starts each source; its absence is what
+        # proves the run never began.
+        assert "crawling source" not in capsys.readouterr().err
+
+    def test_a_dry_run_creates_no_directory(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # A dry run that made directories would not be dry.
+        target = tmp_path / "never" / "created" / "leads.csv"
+        code = cli(
+            [
+                "--source",
+                "mock",
+                "--limit",
+                "5",
+                "--format",
+                "csv",
+                "--dry-run",
+                "--output",
+                str(target),
+            ]
+        )
+        assert code == EXIT_OK
+        assert not target.parent.exists()
+
+    def test_a_parent_that_is_a_file_is_reported(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # `--output some_file.txt/leads.csv` is a typo, and the error should say
+        # which path was the problem rather than surfacing a bare errno.
+        blocker = tmp_path / "blocker"
+        blocker.write_text("not a directory", encoding="utf-8")
+        code = cli(["--source", "mock", "--format", "csv", "--output", str(blocker / "leads.csv")])
+
+        assert code == EXIT_CONFIG
+        assert "cannot create output directory" in capsys.readouterr().err
+
+    def test_a_path_that_is_not_a_directory_is_reported(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # Defensive branch: mkdir reported success but the path is not usable as
+        # a directory. Exercised directly because the OSError path above would
+        # otherwise hide it.
+        def pretend_success(self: Path, *args: object, **kwargs: object) -> None:
+            return None
+
+        monkeypatch.setattr(Path, "mkdir", pretend_success)
+        code = cli(
+            ["--source", "mock", "--format", "csv", "--output", str(tmp_path / "sub" / "leads.csv")]
+        )
+        assert code == EXIT_CONFIG
+        assert "is not a directory" in capsys.readouterr().err
+
+
+class TestExportResilience:
+    """One format that cannot be written must not cost the others, or the report."""
+
+    @pytest.fixture
+    def broken_csv_exporter(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Replace the CSV writer with one that always fails.
+
+        Assigned into a copied registry rather than registered through
+        :func:`register_exporter`, which (correctly) refuses to let two classes
+        claim one format — overwriting the real writer here is exactly the
+        intent.
+        """
+        from src.exporters import base as exporter_base
+        from src.models.enums import ExportFormat
+        from src.utils.errors import ExportError as ExportFailure
+
+        class BrokenCsvExporter(exporter_base.BaseExporter):
+            format = ExportFormat.CSV
+            extension = ".csv"
+            description = "Always fails; used to exercise the failure path."
+
+            async def export(self, leads: Any, path: Path) -> Any:
+                raise ExportFailure(f"could not write CSV to {path}")
+
+        monkeypatch.setattr(
+            exporter_base,
+            "_REGISTRY",
+            {**exporter_base._REGISTRY, ExportFormat.CSV: BrokenCsvExporter},
+        )
+
+    def test_the_other_format_is_still_written(
+        self,
+        broken_csv_exporter: None,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        code = cli(
+            [
+                "--source",
+                "mock",
+                "--limit",
+                "5",
+                "--format",
+                "csv,json",
+                "--output-dir",
+                str(tmp_path),
+            ]
+        )
+
+        assert code == EXIT_ERROR
+        err = capsys.readouterr().err
+        assert "export failed" in err
+        assert "csv" in err
+        # The JSON export succeeded, so it must be on disk.
+        assert [Path(name).suffix for name in written_names(tmp_path)] == [".json"]
+
+    def test_the_run_report_survives_an_export_failure(
+        self,
+        broken_csv_exporter: None,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # The report is what explains the crawl; losing it over one unwritable
+        # file would leave the failure undiagnosable.
+        cli(
+            [
+                "--source",
+                "mock",
+                "--limit",
+                "5",
+                "--format",
+                "csv,json",
+                "--output-dir",
+                str(tmp_path),
+            ]
+        )
+
+        report = read_report(tmp_path)
+        assert report["stats"]["raw_collected"] == 5
+
+    def test_a_clean_run_is_unaffected(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # The containment must not turn every run into a partial failure.
+        code = cli(
+            [
+                "--source",
+                "mock",
+                "--limit",
+                "5",
+                "--format",
+                "csv,json",
+                "--output-dir",
+                str(tmp_path),
+            ]
+        )
+        assert code == EXIT_OK
+        assert "export failed" not in capsys.readouterr().err
+        assert len(written_names(tmp_path)) == 2
+
+
 class TestExitCodes:
     def test_empty_result_is_success_by_default(self, tmp_path: Path) -> None:
         empty = tmp_path / "empty.csv"

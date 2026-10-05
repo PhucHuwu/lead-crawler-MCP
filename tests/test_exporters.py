@@ -29,8 +29,18 @@ from src.exporters import (
 from src.exporters.base import UNKNOWN_SOURCE_SLUG, ExportResult, available_formats
 from src.models.enums import ExportFormat, RejectionReason
 from src.models.results import CrawlResult, CrawlStats, RejectedLead
+from src.processors.normalizer import Normalizer
 from src.utils.errors import ExportError
 from tests.conftest import make_lead
+from tests.fixtures.records import (
+    INTERNATIONAL_COMPANIES,
+    INTERNATIONAL_NAMES,
+    complete_lead,
+    missing_company,
+    missing_email,
+    sparse_lead,
+    vietnamese_lead,
+)
 
 
 class TestRegistry:
@@ -409,6 +419,145 @@ class TestUnicodePreservation:
         await write_run_report(result, path, settings)
 
         assert self.VIETNAMESE in path.read_text(encoding="utf-8")
+
+
+class TestRealisticRecordExport:
+    """Whole records through the whole output path.
+
+    The per-field tests above prove each writer handles each value. This proves
+    the *pipeline's* output is faithful: fixtures shaped like real source records
+    are normalized and written, and the values that survive are compared to what
+    went in. That is the layer where a rename, a dropped column or an over-eager
+    cleaner would actually be noticed, because it is the layer the user sees.
+    """
+
+    @pytest.fixture
+    def normalizer(self) -> Normalizer:
+        return Normalizer()
+
+    @pytest.mark.parametrize(
+        "raw_factory",
+        [complete_lead, missing_email, missing_company, sparse_lead],
+        ids=["complete", "no-email", "no-company", "sparse"],
+    )
+    async def test_a_normalized_record_survives_json_unchanged(
+        self, settings: Settings, tmp_path: Path, normalizer: Normalizer, raw_factory: object
+    ) -> None:
+        raw = raw_factory()  # type: ignore[operator]
+        lead = normalizer.normalize(raw)
+        path = tmp_path / "leads.json"
+        await JsonExporter(settings).export([lead], path)
+
+        entry = json.loads(path.read_text(encoding="utf-8"))[0]
+        assert entry["person"]["email"] == lead.person.email
+        assert entry["company"]["name"] == lead.company.name
+        assert entry["company"]["domain"] == lead.company.domain
+        assert entry["lead_id"] == lead.lead_id
+
+    @pytest.mark.parametrize(
+        "raw_factory",
+        [complete_lead, missing_email, missing_company, sparse_lead],
+        ids=["complete", "no-email", "no-company", "sparse"],
+    )
+    async def test_a_normalized_record_survives_csv_unchanged(
+        self, settings: Settings, tmp_path: Path, normalizer: Normalizer, raw_factory: object
+    ) -> None:
+        raw = raw_factory()  # type: ignore[operator]
+        lead = normalizer.normalize(raw)
+        path = tmp_path / "leads.csv"
+        await CsvExporter(settings).export([lead], path)
+
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            row = next(csv.DictReader(handle))
+
+        assert row["person_email"] == (lead.person.email or "")
+        assert row["company_name"] == (lead.company.name or "")
+        assert row["lead_id"] == lead.lead_id
+
+    async def test_every_declared_column_is_written(
+        self, settings: Settings, tmp_path: Path, normalizer: Normalizer
+    ) -> None:
+        # A field present on the model but missing from the header is dropped
+        # for every future run, silently. Comparing the written header to
+        # ``LEAD_COLUMNS`` is what catches a model change that forgot the CSV.
+        path = tmp_path / "leads.csv"
+        lead = normalizer.normalize(complete_lead())
+        await CsvExporter(settings).export([lead], path)
+
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            header = next(csv.reader(handle))
+
+        assert tuple(header) == LEAD_COLUMNS
+        assert len(header) == len(set(header)), "duplicate column names"
+
+    async def test_a_fully_populated_record_writes_no_blank_cells(
+        self, settings: Settings, tmp_path: Path, normalizer: Normalizer
+    ) -> None:
+        # ``complete_lead`` claims to be the "nothing is missing" reference, so
+        # every column it feeds should be populated. A blank here means either
+        # the fixture or the normalizer is dropping a field it was given.
+        path = tmp_path / "leads.csv"
+        await CsvExporter(settings).export([normalizer.normalize(complete_lead())], path)
+
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            row = next(csv.DictReader(handle))
+
+        empty = [name for name, value in row.items() if value == ""]
+        assert empty == [], f"columns unexpectedly empty: {empty}"
+
+    @pytest.mark.parametrize(
+        ("value", "script"),
+        [*INTERNATIONAL_NAMES, *INTERNATIONAL_COMPANIES],
+    )
+    async def test_every_script_round_trips_through_every_format(
+        self, settings: Settings, tmp_path: Path, value: str, script: str
+    ) -> None:
+        # The same text through all three writers, compared as bytes as well as
+        # parsed values: a writer that transliterated or escaped would still
+        # produce a file that opens.
+        leads = [make_lead(full_name=value, company_name=value)]
+        csv_path, json_path, jsonl_path = (
+            tmp_path / "leads.csv",
+            tmp_path / "leads.json",
+            tmp_path / "leads.jsonl",
+        )
+
+        await CsvExporter(settings).export(leads, csv_path)
+        await JsonExporter(settings).export(leads, json_path)
+        await JsonLinesExporter(settings).export(leads, jsonl_path)
+
+        with csv_path.open(encoding="utf-8-sig", newline="") as handle:
+            assert next(csv.DictReader(handle))["person_full_name"] == value
+
+        assert json.loads(json_path.read_text(encoding="utf-8"))[0]["person"]["full_name"] == value
+        line = jsonl_path.read_text(encoding="utf-8").splitlines()[0]
+        assert json.loads(line)["person"]["full_name"] == value
+
+        # Byte-level, so a lossy encode cannot pass on a lucky decode.
+        assert value.encode("utf-8") in csv_path.read_bytes()
+        assert value.encode("utf-8") in json_path.read_bytes()
+        assert value.encode("utf-8") in jsonl_path.read_bytes()
+
+    async def test_a_vietnamese_record_from_a_messy_source_lands_intact(
+        self, settings: Settings, tmp_path: Path, normalizer: Normalizer
+    ) -> None:
+        # End to end from the raw shape a Vietnamese vendor would export,
+        # including the row whose website column holds a sentence.
+        lead = normalizer.normalize(vietnamese_lead("NFD"))
+        path = tmp_path / "leads.csv"
+        await CsvExporter(settings).export([lead], path)
+
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            row = next(csv.DictReader(handle))
+
+        # Composed on the way out regardless of how it arrived — a decomposed
+        # export is a file that looks fine and breaks every string comparison.
+        assert row["person_full_name"] == "Nguyễn Văn An"
+        assert row["company_city"] == "Hà Nội"
+        # The legal form arrives folded (`TNHH` -> `Tnhh`); see
+        # TestVietnameseData::test_legal_forms_are_folded_like_shouting for why
+        # that is recorded as a limitation rather than fixed here.
+        assert row["company_name"] == "Công ty Tnhh Giải pháp Số"
 
 
 class TestExportResult:

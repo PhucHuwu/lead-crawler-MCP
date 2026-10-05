@@ -154,7 +154,9 @@ class CrawlResult(BaseModel):
     leads: list[StandardizedLead] = Field(default_factory=list)
     stats: CrawlStats = Field(default_factory=CrawlStats)
     rejections: list[RejectedLead] = Field(default_factory=list)
-    #: True when more rejections occurred than :data:`MAX_RECORDED_REJECTIONS`.
+    #: True when more rejections occurred than the run recorded. The limit is the
+    #: caller's ``max_recorded_rejections``, itself capped by
+    #: :data:`~src.processors.pipeline.MAX_RECORDED_REJECTIONS`.
     rejections_truncated: bool = False
 
     @property

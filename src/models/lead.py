@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import unicodedata
 from datetime import datetime
 from typing import Any, Self
 
@@ -31,7 +32,51 @@ from src.models.enums import SeniorityLevel
 from src.models.person import Person
 from src.utils.time import to_iso, utcnow
 
-_SLUG_RE = re.compile(r"[^a-z0-9]+")
+#: Characters a slug drops: anything that is not a letter or digit in *any*
+#: script, plus the underscore (a word character that is not a name character).
+#: Deliberately not ``[^a-z0-9]`` — that erased every non-Latin script, so a
+#: Cyrillic or Korean name slugged to the empty string and a lead without an
+#: email lost every name-based identity key it had, including the ability to
+#: match an exact copy of itself.
+_SLUG_RE = re.compile(r"[\W_]+")
+
+#: The one fold NFKD cannot do for us. ``Đ``/``đ`` is a distinct Vietnamese
+#: *letter*, not a marked ``D``, so normalization leaves it intact and a name
+#: spelled ``Đặng`` would never match the same name spelled ``Dang`` — a
+#: spelling difference Vietnamese exports make constantly, since keyboards and
+#: older systems often omit the stroke. Folding it here treats the two
+#: spellings as the one person they are.
+_SLUG_FOLDS = str.maketrans({"đ": "d", "Đ": "d"})
+
+
+def _fold_marks(value: str) -> str:
+    """Drop diacritics while keeping the letters underneath, in any script.
+
+    Decomposing first separates a marked letter into its base plus combining
+    marks, so discarding the marks leaves the base. This is what makes
+    ``Nguyễn`` and ``Nguyen`` the same slug, which matters more here than
+    anywhere else: the shipped search profiles target Vietnam, and the same
+    person is routinely spelled both ways by different sources.
+
+    NFKD is used rather than a codepoint table so the fold covers every script
+    Unicode knows about, not just Latin.
+    """
+    decomposed = unicodedata.normalize("NFKD", value)
+    return "".join(char for char in decomposed if not unicodedata.combining(char))
+
+
+def slugify_identity(value: str | None) -> str:
+    """Reduce a name to a comparable slug (``Ada O'Neill`` -> ``adaoneill``).
+
+    Lossy on purpose: the result is a matching key, not a display value, so
+    case, punctuation, spacing and diacritics are all discarded — and the
+    letters themselves are kept whatever the script, because a name that
+    survives as an empty string is a name no record can be matched by.
+    """
+    if not value:
+        return ""
+    return _SLUG_RE.sub("", _fold_marks(value.casefold()).translate(_SLUG_FOLDS))
+
 
 #: Relative weight of each signal when scoring how actionable a lead is. Email
 #: and company domain dominate because outreach and qualification both depend on
@@ -46,13 +91,6 @@ _COMPLETENESS_WEIGHTS: dict[str, float] = {
     "company_country": 0.05,
     "phone": 0.05,
 }
-
-
-def slugify_identity(value: str | None) -> str:
-    """Reduce a name to a comparable slug (``Ada O'Neill`` -> ``adaoneill``)."""
-    if not value:
-        return ""
-    return _SLUG_RE.sub("", value.casefold())
 
 
 def format_social_links(links: dict[str, str]) -> str | None:

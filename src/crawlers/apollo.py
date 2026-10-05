@@ -247,6 +247,7 @@ class ApolloCrawler(BaseCrawler):
 
         per_page = min(self._config.per_page, self.max_per_page, limit)
         collected: list[RawLead] = []
+        unmappable = 0
         self.logger.debug("apollo search resolved", extra=self._search.summary())
 
         for page in range(1, self._max_pages + 1):
@@ -265,7 +266,16 @@ class ApolloCrawler(BaseCrawler):
                 )
                 break
 
-            collected.extend(self._map_person(person) for person in people)
+            # One person Apollo describes in a way we cannot map costs that
+            # person, not the page — let alone the run.
+            page_leads, failed = self.map_records(
+                people,
+                self._map_person,
+                kind="Apollo person",
+                label=_person_label,
+            )
+            collected.extend(page_leads)
+            unmappable += failed
 
             if len(people) < per_page:
                 # A short page means we have reached the end of the result set.
@@ -274,7 +284,7 @@ class ApolloCrawler(BaseCrawler):
         result = collected[:limit]
         self.logger.info(
             "collected leads from apollo",
-            extra={"count": len(result), "requested": limit},
+            extra={"count": len(result), "requested": limit, "unmappable": unmappable},
         )
         return result
 
@@ -329,6 +339,19 @@ class ApolloCrawler(BaseCrawler):
             company_linkedin_url=_as_str(_get(organization, "linkedin_url")),
             raw=person,
         )
+
+
+def _person_label(person: dict[str, Any]) -> str:
+    """Identify one Apollo person in a log line.
+
+    Prefers the stable id, then the email, then the name — the same order of
+    certainty as :meth:`RawLead.label`, but readable off the *unmapped* payload,
+    which is the only thing available when mapping is what failed.
+    """
+    for key in ("id", "email", "name"):
+        if (value := _as_str(_get(person, key))) is not None:
+            return value
+    return "<unidentified>"
 
 
 def _get(mapping: dict[str, Any], key: str) -> Any:

@@ -24,7 +24,9 @@ from src.crawlers.registry import (
 )
 from src.models.lead import RawLead
 from src.processors.normalizer import Normalizer
-from src.utils.errors import ConfigError, SourceNotFoundError
+from src.utils.errors import ConfigError, CrawlerError, SourceNotFoundError
+from tests.conftest import log_record
+from tests.fixtures.records import VIETNAMESE_CSV
 
 BUILTIN_PROVIDERS = {"apollo", "csv", "mock"}
 
@@ -280,16 +282,193 @@ class TestCsvCrawler:
         assert ok is False
         assert "not a file" in reason
 
-    def test_set_path_retargets_the_crawler(self, tmp_path: Path, settings: Settings) -> None:
-        # This is how the CLI's --csv-path flag reaches the instance.
+    def test_a_configured_path_makes_the_crawler_available(self, tmp_path: Path) -> None:
+        # This is how the CLI's --csv-path flag reaches the instance: it is
+        # resolved into settings before construction, not applied afterwards.
         path = tmp_path / "later.csv"
         path.write_text("Email\nada@acme.com\n", encoding="utf-8")
-        crawler = CsvCrawler(settings)
-        assert crawler.is_available()[0] is False
-        crawler.set_path(path)
-        assert crawler.is_available() == (True, "")
+        assert CsvCrawler(csv_settings(path)).is_available() == (True, "")
 
     def test_class_metadata_is_complete(self) -> None:
         assert CsvCrawler.display_name
         assert CsvCrawler.description
         assert CsvCrawler.requires_credentials is False
+
+
+class TestCsvCrawlerResilience:
+    """A bad file must degrade to a partial read, not to a failed source."""
+
+    async def test_blank_rows_do_not_consume_the_limit(self, tmp_path: Path) -> None:
+        # `--limit` counts leads. A sheet padded with blank rows is common, and
+        # letting them eat the budget would return fewer leads than were asked
+        # for while more were sitting right there in the file.
+        path = tmp_path / "gaps.csv"
+        path.write_text(
+            "Email,Company\nada@acme.com,Acme Corp\n,,\ngrace@navy.example.com,Navy Systems\n",
+            encoding="utf-8",
+        )
+        leads = await CsvCrawler(csv_settings(path)).crawl(2)
+        assert [lead.email for lead in leads] == ["ada@acme.com", "grace@navy.example.com"]
+
+    async def test_a_malformed_row_keeps_every_row_read_before_it(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The csv module raises from the middle of the stream and cannot resume,
+        # so the alternative to this behaviour is losing the whole file — a
+        # 50 000-row export discarded over one pathological cell.
+        path = tmp_path / "huge.csv"
+        path.write_text(
+            f"Email,Company\nada@acme.com,Acme Corp\ngrace@navy.example.com,{'x' * 200_000}\n",
+            encoding="utf-8",
+        )
+        with caplog.at_level("WARNING", logger="crawlers.csv"):
+            leads = await CsvCrawler(csv_settings(path)).crawl(100)
+
+        assert [lead.email for lead in leads] == ["ada@acme.com"]
+        stopped = log_record(caplog, "stopped reading csv at a malformed row")
+        # The line number is what lets an operator open the file and look.
+        assert stopped.row == 3
+        assert "field larger than field limit" in stopped.error
+
+    async def test_an_unreadable_file_names_the_path(self, tmp_path: Path) -> None:
+        # A directory is the portable stand-in for "the open itself failed": no
+        # permissions to arrange, and it raises the same OSError family.
+        crawler = CsvCrawler(csv_settings(tmp_path))
+        with pytest.raises(CrawlerError, match="cannot read") as excinfo:
+            await crawler.crawl(1)
+        assert str(tmp_path) in str(excinfo.value)
+
+    async def test_a_row_that_cannot_be_mapped_does_not_kill_the_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        path = tmp_path / "leads.csv"
+        path.write_text(
+            "Email,Company\nada@acme.com,Acme Corp\ngrace@navy.example.com,Navy Systems\n",
+            encoding="utf-8",
+        )
+        crawler = CsvCrawler(csv_settings(path))
+        original = crawler._row_to_lead
+
+        def flaky(row: object, targets: object, number: int) -> RawLead | None:
+            if isinstance(row, dict) and row.get("Email") == "grace@navy.example.com":
+                raise ValueError("unreadable cell")
+            return original(row, targets, number)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(crawler, "_row_to_lead", flaky)
+        with caplog.at_level("WARNING", logger="crawlers.csv"):
+            leads = await crawler.crawl(10)
+
+        assert [lead.email for lead in leads] == ["ada@acme.com"]
+        warning = log_record(caplog, "could not map csv row; skipping it")
+        assert warning.record == "row 3"
+        assert "unreadable cell" in warning.error
+
+    async def test_the_limit_stops_the_file_being_read_further(self, tmp_path: Path) -> None:
+        # The reader is a generator precisely so a limit does not require
+        # materializing the whole file first.
+        path = tmp_path / "long.csv"
+        rows = "".join(f"user{index}@acme.com,Acme Corp\n" for index in range(5000))
+        path.write_text(f"Email,Company\n{rows}", encoding="utf-8")
+        assert len(await CsvCrawler(csv_settings(path)).crawl(3)) == 3
+
+
+class TestVietnameseCsvSource:
+    """A CSV as a Vietnamese vendor exports it, read end to end.
+
+    The header row is Vietnamese, so nothing matches the built-in English
+    aliases and the run depends on ``column_map`` — which is exactly how a real
+    user reads one of these files, and a path no other test exercises. The
+    diacritics run through the whole adapter, and one row carries a sentence in
+    its website column instead of a domain.
+    """
+
+    #: ``target=Source Header``, the way the CLI takes it. Written out rather
+    #: than derived from the fixture so the header text is asserted, not assumed.
+    HEADER_MAP = [
+        "full_name=Họ và tên",
+        "job_title=Chức danh",
+        "email=Email",
+        "company_name=Công ty",
+        "company_website=Website",
+        "company_city=Thành phố",
+        "company_country=Quốc gia",
+    ]
+
+    @pytest.fixture
+    def vietnamese_csv(self, tmp_path: Path) -> Path:
+        path = tmp_path / "khach-hang.csv"
+        path.write_text(VIETNAMESE_CSV, encoding="utf-8")
+        return path
+
+    async def test_every_row_is_read(self, vietnamese_csv: Path) -> None:
+        leads = await CsvCrawler(csv_settings(vietnamese_csv, column_map=self.HEADER_MAP)).crawl(
+            100
+        )
+        assert len(leads) == 3
+
+    async def test_vietnamese_headers_map_onto_the_schema(self, vietnamese_csv: Path) -> None:
+        first = (
+            await CsvCrawler(csv_settings(vietnamese_csv, column_map=self.HEADER_MAP)).crawl(100)
+        )[0]
+        assert first.full_name == "Nguyễn Văn An"
+        assert first.job_title == "Giám đốc Kỹ thuật"
+        assert first.email == "an.nguyen@congty.vn"
+        assert first.company_name == "Công ty TNHH Giải pháp Số"
+        assert first.company_city == "Hà Nội"
+        assert first.company_country == "Việt Nam"
+
+    async def test_diacritics_are_not_folded_by_the_adapter(self, vietnamese_csv: Path) -> None:
+        # The adapter maps columns and nothing else; if it were transliterating,
+        # the accents would be gone before the normalizer ever saw them.
+        leads = await CsvCrawler(csv_settings(vietnamese_csv, column_map=self.HEADER_MAP)).crawl(
+            100
+        )
+        assert [lead.full_name for lead in leads] == [
+            "Nguyễn Văn An",
+            "Trần Thị Bích",
+            "Phạm Minh Đức",
+        ]
+
+    async def test_a_sentence_in_the_website_column_does_not_stop_the_read(
+        self, vietnamese_csv: Path
+    ) -> None:
+        # The third row's website is prose, which yields no domain. It must cost
+        # that row its website and nothing else: the row survives, the domain is
+        # recovered from the corporate address instead, and the unusable value
+        # is recorded rather than silently dropped.
+        leads = await CsvCrawler(csv_settings(vietnamese_csv, column_map=self.HEADER_MAP)).crawl(
+            100
+        )
+        third = leads[2]
+        assert third.company_website == "see our website it is great"
+        assert third.full_name == "Phạm Minh Đức"
+
+        lead = Normalizer().normalize(third)
+        assert lead.company.domain == "khac.vn"  # from duc.pham@khac.vn
+        # The website is rebuilt from that recovered domain rather than kept as
+        # the unusable text — the prose is discarded, not stored in its place.
+        assert lead.company.website == "https://khac.vn"
+        assert [issue.rule for issue in lead.normalization_issues] == ["malformed_url"]
+        assert lead.normalization_issues[0].field == "company_website"
+
+    async def test_the_other_rows_keep_the_domain_from_their_website(
+        self, vietnamese_csv: Path
+    ) -> None:
+        # The contrast that makes the row above meaningful: a real domain in the
+        # website column is used, and raises no issue.
+        leads = await CsvCrawler(csv_settings(vietnamese_csv, column_map=self.HEADER_MAP)).crawl(
+            100
+        )
+        lead = Normalizer().normalize(leads[0])
+        assert lead.company.domain == "congty.vn"
+        assert lead.normalization_issues == []
+
+    async def test_the_header_row_is_not_read_as_a_lead(self, vietnamese_csv: Path) -> None:
+        leads = await CsvCrawler(csv_settings(vietnamese_csv, column_map=self.HEADER_MAP)).crawl(
+            100
+        )
+        assert "Họ và tên" not in [lead.full_name for lead in leads]
+
+    async def test_the_limit_applies(self, vietnamese_csv: Path) -> None:
+        crawler = CsvCrawler(csv_settings(vietnamese_csv, column_map=self.HEADER_MAP))
+        assert len(await crawler.crawl(2)) == 2

@@ -14,6 +14,28 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import IO
 
+from src.utils.errors import ConfigError
+
+
+def ensure_directory(path: Path, *, what: str = "directory") -> Path:
+    """Create ``path`` if it is missing, then confirm it is a directory.
+
+    ``what`` names the path in the error message, so a caller can say "output
+    directory" where a bare "directory" would leave the reader guessing which
+    of several paths was at fault.
+
+    Raises:
+        ConfigError: if the directory cannot be created, or the path exists as
+            something that is not a directory.
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ConfigError(f"cannot create {what} {path}: {exc}") from exc
+    if not path.is_dir():
+        raise ConfigError(f"{what} {path} exists but is not a directory")
+    return path
+
 
 @contextmanager
 def atomic_write(

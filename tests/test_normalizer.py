@@ -9,6 +9,12 @@ import pytest
 from src.models.enums import SeniorityLevel
 from src.processors.normalizer import MAX_PLAUSIBLE_EMPLOYEES, Normalizer
 from tests.conftest import make_raw_lead
+from tests.fixtures.records import (
+    INTERNATIONAL_COMPANIES,
+    INTERNATIONAL_NAMES,
+    VIETNAMESE_CITIES,
+    VIETNAMESE_NAMES,
+)
 
 
 @pytest.fixture
@@ -174,6 +180,165 @@ class TestCompanyNormalization:
             make_raw_lead(company_linkedin_url="https://uk.linkedin.com/company/Acme/")
         )
         assert lead.company.linkedin_url == "https://www.linkedin.com/company/acme"
+
+
+class TestVietnameseData:
+    """Vietnamese records, which the shipped search profiles target.
+
+    Vietnam-specific hazards are not hypothetical here: a company's legal form
+    (``Công ty TNHH``, ``Cổ phần``) is part of its name, addresses are written
+    street-last, and the same text arrives composed from an API and decomposed
+    from a Mac. All of it has to survive normalization intact.
+    """
+
+    @pytest.mark.parametrize("name", VIETNAMESE_NAMES)
+    def test_names_keep_every_diacritic(self, normalizer: Normalizer, name: str) -> None:
+        lead = normalizer.normalize(make_raw_lead(full_name=name, first_name=None, last_name=None))
+        assert lead.person.full_name == name
+
+    @pytest.mark.parametrize("name", VIETNAMESE_NAMES)
+    def test_the_decomposed_form_reaches_the_same_string(
+        self, normalizer: Normalizer, name: str
+    ) -> None:
+        decomposed = unicodedata.normalize("NFD", name)
+        composed_lead = normalizer.normalize(
+            make_raw_lead(full_name=name, first_name=None, last_name=None)
+        )
+        decomposed_lead = normalizer.normalize(
+            make_raw_lead(full_name=decomposed, first_name=None, last_name=None)
+        )
+        assert decomposed_lead.person.full_name == composed_lead.person.full_name
+
+    @pytest.mark.parametrize("company", [name for name, _ in INTERNATIONAL_COMPANIES])
+    def test_company_names_lose_no_letters(self, normalizer: Normalizer, company: str) -> None:
+        # The invariant that matters: whatever title-casing does to the shape of
+        # a name, it must not add or drop a character. A truncated
+        # `Công ty TNHH Giải pháp Số` would make every Vietnamese company the
+        # same company.
+        lead = normalizer.normalize(make_raw_lead(company_name=company))
+        assert lead.company.name is not None
+        assert lead.company.name.casefold() == company.casefold()
+
+    @pytest.mark.parametrize(
+        "company",
+        ["東京テクノロジー株式会社", "شركة الحلول الرقمية", "Acme & Sons, Inc.", "Công ty Cổ phần"],
+    )
+    def test_company_names_without_shouting_are_untouched(
+        self, normalizer: Normalizer, company: str
+    ) -> None:
+        lead = normalizer.normalize(make_raw_lead(company_name=company))
+        assert lead.company.name == company
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("Công ty TNHH Giải pháp Số", "Công ty Tnhh Giải pháp Số"),
+            ("ООО Технологии", "Ооо Технологии"),
+            ("ACME CORP", "Acme Corp"),
+        ],
+    )
+    def test_legal_forms_are_folded_like_shouting(
+        self, normalizer: Normalizer, raw: str, expected: str
+    ) -> None:
+        # A known limitation, pinned so it is visible rather than discovered in
+        # an export. Company names are title-cased by the same helper as person
+        # names, and that helper can only ask "is this token all-caps?" — so a
+        # legal form (`TNHH`, `ООО`) is indistinguishable from a shouted word
+        # and is folded to `Tnhh`/`Ооо`. Separating the two needs a list of
+        # legal forms per language, which is why it is recorded here instead.
+        #
+        # Display-only: the slug is built from casefolded text, so `Tnhh` and
+        # `TNHH` produce the same `name_company` key and matching is unaffected.
+        lead = normalizer.normalize(make_raw_lead(company_name=raw))
+        assert lead.company.name == expected
+
+    @pytest.mark.parametrize("city", VIETNAMESE_CITIES)
+    def test_cities_survive(self, normalizer: Normalizer, city: str) -> None:
+        lead = normalizer.normalize(make_raw_lead(company_city=city))
+        assert lead.company.city == city
+
+    def test_a_city_is_not_mistaken_for_a_country(self, normalizer: Normalizer) -> None:
+        # `Hà Nội` must not be coerced to an ISO country code, and an unknown
+        # country must pass through rather than be dropped.
+        lead = normalizer.normalize(
+            make_raw_lead(company_city="Hà Nội", company_country="Việt Nam")
+        )
+        assert lead.company.city == "Hà Nội"
+        assert lead.company.country == "Việt Nam"
+
+    def test_vietnam_is_recognized_however_it_is_spelled(self, normalizer: Normalizer) -> None:
+        for spelling in ("Vietnam", "Viet Nam", "VIETNAM", "vietnam"):
+            lead = normalizer.normalize(make_raw_lead(company_country=spelling))
+            assert lead.company.country == "VN", spelling
+
+    def test_a_vietnamese_title_is_not_treated_as_a_seniority_keyword(
+        self, normalizer: Normalizer
+    ) -> None:
+        # The seniority vocabulary is English (`head`, `vp`, `owner`). A
+        # Vietnamese title must fall through to UNKNOWN rather than match by
+        # accident, so the record is not silently ranked on a guess.
+        lead = normalizer.normalize(make_raw_lead(job_title="Giám đốc Kỹ thuật", seniority=None))
+        assert lead.person.seniority is SeniorityLevel.UNKNOWN
+
+    def test_a_vietnamese_company_without_a_domain_keeps_its_identity_key(
+        self, normalizer: Normalizer
+    ) -> None:
+        # The end-to-end property the slug fix exists for: strip the email and
+        # the only thing left to match on is the name plus the company name.
+        lead = normalizer.normalize(
+            make_raw_lead(
+                full_name="Nguyễn Văn An",
+                first_name=None,
+                last_name=None,
+                company_name="Công ty TNHH Giải pháp Số",
+                company_domain=None,
+                company_website=None,
+                email=None,
+            )
+        )
+        assert lead.identity_keys(), "a Vietnamese lead lost every identity key"
+
+
+class TestInternationalScripts:
+    """Every script the crawler can meet, through the whole normalization path."""
+
+    @pytest.mark.parametrize(("name", "script"), INTERNATIONAL_NAMES)
+    def test_a_name_in_any_script_round_trips(
+        self, normalizer: Normalizer, name: str, script: str
+    ) -> None:
+        lead = normalizer.normalize(make_raw_lead(full_name=name, first_name=None, last_name=None))
+        assert lead.person.full_name == name, script
+
+    @pytest.mark.parametrize(("name", "script"), INTERNATIONAL_NAMES)
+    def test_a_non_latin_lead_keeps_an_identity_key(
+        self, normalizer: Normalizer, name: str, script: str
+    ) -> None:
+        # Without this, a record from any non-Latin script with no email is
+        # invisible to deduplication: two copies of one person stay two leads.
+        lead = normalizer.normalize(
+            make_raw_lead(
+                full_name=name,
+                first_name=None,
+                last_name=None,
+                company_name="Acme Corp",
+                email=None,
+            )
+        )
+        assert lead.identity_keys(), f"{script} lead has no identity keys"
+
+    def test_a_name_is_not_reduced_to_ascii(self, normalizer: Normalizer) -> None:
+        # Transliteration would be a silent change of a person's name in the
+        # output, which is worse than an unmerged duplicate.
+        lead = normalizer.normalize(
+            make_raw_lead(full_name="Ольга Иванова", first_name=None, last_name=None)
+        )
+        assert lead.person.full_name == "Ольга Иванова"
+
+    def test_right_to_left_text_is_not_reordered(self, normalizer: Normalizer) -> None:
+        lead = normalizer.normalize(
+            make_raw_lead(full_name="محمد الأحمد", first_name=None, last_name=None)
+        )
+        assert lead.person.full_name == "محمد الأحمد"
 
 
 class TestProvenance:

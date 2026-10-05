@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -41,6 +40,7 @@ from src.crawlers.registry import register_crawler
 from src.models.lead import RawLead
 from src.utils.errors import CrawlerError, LeadCrawlerError
 from src.utils.http import AsyncHttpClient, RetryPolicy
+from src.utils.logging import get_logger
 from src.utils.text import clean_text, normalize_email
 from src.utils.urls import (
     normalize_domain,
@@ -52,7 +52,7 @@ from src.utils.urls import (
 if TYPE_CHECKING:
     from src.config import Settings
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 #: `<meta>` keys worth reading, in the order they win when several are present.
 #: Open Graph first: it is written deliberately for machines, whereas a meta

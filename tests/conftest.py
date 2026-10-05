@@ -8,6 +8,7 @@ repository's ``data/`` directory.
 from __future__ import annotations
 
 import os
+import socket
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,61 @@ def _isolate_environment(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     monkeypatch.chdir(tmp_path)
 
 
+class NetworkAccessAttempted(RuntimeError):
+    """Raised when a test tries to open a real outbound connection."""
+
+
+def _blocked(what: str) -> NetworkAccessAttempted:
+    return NetworkAccessAttempted(
+        f"a test attempted a real network call ({what}). "
+        "Outbound HTTP must be mocked with respx; see tests/test_apollo.py. "
+        "If a test genuinely needs a socket, opt out with "
+        "@pytest.mark.allow_network."
+    )
+
+
+@pytest.fixture(autouse=True)
+def _forbid_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail any test that reaches for the network.
+
+    "Tests must never call the real Apollo API" is a property worth *enforcing*
+    rather than trusting: respx's ``assert_all_mocked`` only guards a test that
+    happens to make a request through a mocked router, so a future edit that
+    called ``crawl()`` outside a respx context would quietly hit the live API —
+    and with a key in the environment, would spend real credits and leak real
+    contact data into an assertion.
+
+    The chokepoints are :func:`socket.getaddrinfo` and ``socket.socket.connect``,
+    which every outbound TCP path goes through: httpx, requests, and anything
+    built on them. Blocking name resolution as well as connection means the
+    failure message arrives before any DNS traffic leaves the machine.
+
+    Opt out per-test with ``@pytest.mark.allow_network`` for the rare case that
+    needs a real socket (a local server, say).
+    """
+    if request.node.get_closest_marker("allow_network"):
+        return
+
+    def deny_getaddrinfo(*args: Any, **kwargs: Any) -> Any:
+        raise _blocked(f"DNS lookup of {args[0] if args else '?'!r}")
+
+    def deny_connect(self: socket.socket, address: Any, *args: Any, **kwargs: Any) -> Any:
+        raise _blocked(f"connection to {address!r}")
+
+    def deny_connect_ex(self: socket.socket, address: Any, *args: Any, **kwargs: Any) -> Any:
+        raise _blocked(f"connection to {address!r}")
+
+    def deny_create_connection(address: Any, *args: Any, **kwargs: Any) -> Any:
+        raise _blocked(f"connection to {address!r}")
+
+    monkeypatch.setattr(socket, "getaddrinfo", deny_getaddrinfo)
+    monkeypatch.setattr(socket.socket, "connect", deny_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", deny_connect_ex)
+    # ``create_connection`` is the higher-level helper urllib3 uses when it is
+    # handed a hostname rather than an address, so it needs closing too.
+    monkeypatch.setattr(socket, "create_connection", deny_create_connection)
+
+
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     """Default settings writing into a per-test temporary directory."""
@@ -50,6 +106,20 @@ def settings(tmp_path: Path) -> Settings:
 def empty_filters() -> FilterSettings:
     """Filter criteria with every rule at its default (nothing filtered)."""
     return FilterSettings()
+
+
+def log_record(caplog: pytest.LogCaptureFixture, message: str) -> Any:
+    """The one captured record whose message is exactly ``message``.
+
+    The return type is ``Any`` because the fields worth asserting on are the ones
+    passed through ``extra=``, which :class:`logging.LogRecord` does not declare —
+    an attribute a test can read but a type checker cannot see. Asserting that
+    exactly one record matched also keeps a test from passing on a line it did
+    not mean to inspect.
+    """
+    matches = [record for record in caplog.records if record.getMessage() == message]
+    assert len(matches) == 1, f"expected one {message!r} record, found {len(matches)}"
+    return matches[0]
 
 
 def make_raw_lead(**overrides: object) -> RawLead:
