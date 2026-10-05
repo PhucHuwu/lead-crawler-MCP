@@ -69,6 +69,105 @@ design decision that follows:
 
 ---
 
+## Installation
+
+Requires **Python 3.11+**. The project was developed against CPython 3.13, and a
+`uv.lock` is committed.
+
+```bash
+git clone <repo> && cd lead-crawler-MCP
+
+# With uv — the lockfile exists for this, and it is the supported path:
+uv sync --extra dev
+source .venv/bin/activate
+
+# …or with plain pip and no uv:
+python -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+```
+
+There is no `requirements.txt`. Dependencies are declared once in
+`pyproject.toml` and pinned in `uv.lock`, so there is nothing for a second file
+to hold that would not immediately drift.
+
+> **`--extra dev` is not optional.** The test and lint tools (pytest, ruff, mypy)
+> live in the `dev` extra, and a bare `uv sync` installs only the runtime
+> dependencies — then silently *removes* the dev tools if they were already
+> there.
+
+Verify the install:
+
+```bash
+python -m src.main --source mock --limit 5 --dry-run
+```
+
+Every command in this README works either as `python -m src.main …` (from the
+repo root) or as `lead-crawler …` (the installed console script).
+
+---
+
+## Configuration
+
+Configuration lives in two places, and the split is deliberate:
+
+| Where | Holds | Committed? |
+| ----- | ----- | ---------- |
+| `.env` and the environment | Credentials and machine-specific values | No — `.env` is gitignored; `.env.example` is the template |
+| `config/*.yaml` | *What to search for* and *which results to keep* | Yes — a targeting rule has to be reviewable in a diff |
+
+A credential must never be committed, and a targeting rule must never be a shell
+incantation. Keeping them in separate files is what makes both true.
+
+### Environment and `.env`
+
+```bash
+cp .env.example .env
+```
+
+`.env.example` lists every setting with its built-in default, so it doubles as
+the reference. Settings are read with a `LEAD_` prefix and nested sections use a
+double underscore — `LEAD_APOLLO__API_KEY`, `LEAD_FILTERS__REQUIRE_EMAIL`.
+List-valued settings accept either comma-separated text (`US,CA`) or a JSON array
+(`["US","CA"]`).
+
+The prefix is enforced rather than advisory: a near-miss such as
+`APOLLO_API_KEY` stops the run with exit code 2 and names the variable to use
+instead, because a secret that is silently not read is indistinguishable from
+having no key at all. The complete table is under
+[Environment variables](#environment-variables).
+
+CLI flags override the environment for a single run, and an *omitted* flag never
+clobbers an environment value — which is why the boolean filters have both
+`--flag` and `--no-flag` forms.
+
+### YAML profiles
+
+Two files sit on top of the environment, for the things that are campaign assets
+rather than per-operator knobs:
+
+| File | Answers | Selected with |
+| ---- | ------- | ------------- |
+| `config/search_profiles.yaml` | *Who are we looking for?* — titles, seniority, locations, headcount bands | `--search-profile NAME` |
+| `config/filters.yaml` | *Which of them do we keep?* — countries, size, contactability | `--filter-profile NAME` |
+
+`--profile NAME` is the umbrella that resolves one name across **both** files at
+once, so one word selects who to look for and which of them to keep. A name
+defined in only one file is legitimate — it contributes that half and leaves the
+other as configured — and `--list-profiles` shows which halves each name covers.
+
+**Both files are inert unless a profile is named.** A missing or malformed
+profile file cannot break a run that never asked for one. Naming a profile
+resolves it eagerly, so a typo costs a message rather than a slice of your Apollo
+quota.
+
+The shipped files, every key, and the exact override order are documented under
+[named search profiles](#named-search-profiles), [named filter
+profiles](#named-filter-profiles) and [one name, both
+halves](#one-name-both-halves).
+
+---
+
 ## Architecture
 
 ### The pipeline
@@ -94,49 +193,7 @@ Stages 3–6 are shared by every source and are reached only through
 `src/processors/pipeline.py`. That is what makes [adding a crawler](#adding-a-new-crawler)
 a one-module change.
 
-`src/`
-
-Requires **Python 3.11+**. The project was developed against CPython 3.13 and a
-`uv.lock` is committed.
-
-```bash
-# With uv (what the lockfile is for):
-uv sync --extra dev
-source .venv/bin/activate
-
-# …or with plain pip:
-python -m venv .venv && source .venv/bin/activate
-pip install -e '.[dev]'
-```
-
-`uv sync` on its own installs only the runtime dependencies — the test and lint
-tools live in the `dev` extra, so `--extra dev` is not optional if you intend to
-run the suite.
-
-Every command below works as either `python -m src.main …` (from the repo root)
-or `lead-crawler …` (the installed console script).
-
-```bash
-# Demo run against the built-in deterministic generator.
-python -m src.main --source mock --limit 50
-
-# Real run against a CSV export.
-python -m src.main --source csv --csv-path samples/leads_sample.csv --format csv,jsonl
-
-# Live source (needs a key — see Environment variables).
-export LEAD_APOLLO__API_KEY=...
-lead-crawler --source apollo --limit 100
-```
-
-Output lands in `data/exports/` as `<prefix>_<source>_<UTC timestamp>.<ext>` plus a
-matching `_report.json` run report; `--output` overrides that with an exact path
-(see [Where the output goes](#where-the-output-goes)). Logs go to **stderr**, the
-run summary to **stdout**, so `--log-format json` composes cleanly with a shell
-pipeline.
-
----
-
-## Architecture
+### The module layout
 
 ```text
 src/
@@ -263,7 +320,7 @@ vocabulary instead, and the rest of the application never sees them.
 
 ---
 
-## CLI usage
+## Usage
 
 Run `python -m src.main --help` for the full surface. The common cases:
 
@@ -372,6 +429,65 @@ default is `csv,json`, `--output` on its own is a configuration error; pass
 `--format` explicitly. With `--output` the run report lands next to your file as
 `<stem>_report.json` rather than being timestamped.
 
+---
+
+## Output
+
+Three formats, one shared schema, written atomically:
+
+| Format | Shape | Pick it when |
+| ------ | ----- | ------------ |
+| `csv` | One flat row per lead, `lead_id` first and `completeness` last | A human will open it in a spreadsheet |
+| `json` | A single pretty-printed array, nested `person` / `company` / `source` | A tool will read the whole document, or you want nothing lost |
+| `jsonl` | One compact object per line | A pipeline will stream it, append to it, or index it line by line |
+
+`csv,json` are the defaults (`LEAD_OUTPUT_FORMATS`). Every format of one run
+shares a filename stem, and each run also writes a `_report.json` sidecar
+explaining what it did.
+
+**CSV is the lossy one, on purpose.** It flattens the nested model into
+`person_*` / `company_*` / `source_*` columns, so a field whose value is a list
+or an object is rendered as text. **JSON/JSONL are the lossless ones** — they
+keep the nested structure and the `normalization_issues` list intact. If you are
+unsure which to keep, keep JSON.
+
+```json
+{
+  "lead_id": "b7c1…",
+  "person": {
+    "full_name": "Nguyễn Văn An",
+    "job_title": "CTO",
+    "job_title_raw": "CTO at Acme Corp",
+    "email": "an.nguyen@acme.vn",
+    "seniority": "c_suite"
+  },
+  "company": { "name": "Acme Corp", "domain": "acme.com", "employee_count": 250 },
+  "source": {
+    "provider": "apollo",
+    "external_id": "66f1…",
+    "source_url": "https://app.apollo.io/#/contacts/66f1…",
+    "collected_at": "2026-10-05T14:03:22.140109Z",
+    "sources": ["apollo"]
+  },
+  "normalization_issues": [],
+  "completeness": 0.86
+}
+```
+
+(Abridged — `person` and `company` each carry the full field set, and
+`job_title_raw` is `null` rather than a duplicate string when cleaning changed
+nothing. The provenance fields all live *inside* `source`, not at the top level.)
+
+```csv
+lead_id,person_first_name,…,company_domain,…,source_provider,…,completeness
+b7c1…,Nguyễn,…,acme.com,…,apollo,…,0.86
+```
+
+Both are UTF-8. CSV additionally carries a BOM by default so Excel detects the
+encoding instead of mangling non-ASCII names; JSON and JSONL are written with
+`ensure_ascii=False`, so Vietnamese, CJK and other non-Latin text appears
+literally rather than as `\uXXXX` escapes and the files stay greppable.
+
 ### What the exports contain
 
 **Encoding.** Every file is UTF-8. CSV additionally carries a BOM by default
@@ -415,7 +531,9 @@ than you expected. It and `--log-level` are mutually exclusive.
 | 4 | `--fail-on-empty` was set and no leads were produced |
 | 130 | Interrupted with `Ctrl+C` |
 
-### When something goes wrong
+---
+
+## Failure handling
 
 A run is built to fail in the smallest unit it can: a bad record costs that
 record, a bad page costs that page, a bad source costs that source, and only a
@@ -965,7 +1083,7 @@ the same output.
 
 ---
 
-## Adding a data source
+## Adding a new crawler
 
 The whole point of the adapter layer: a new source is **one module plus one
 decorator**, with no edit to the pipeline, the models, or the CLI.
@@ -996,21 +1114,40 @@ filters and deduplicator apply unchanged.
 
 ---
 
-## Tests
+## Testing
 
 ```bash
-pytest                      # 858 tests
-pytest tests/test_cli.py -v # one module
-pytest -k dedup             # by name
+pytest                        # 1196 tests
+pytest tests/test_cli.py -v   # one module
+pytest -k dedup               # by name
 
 ruff check . && ruff format --check .
-mypy src tests              # strict
+mypy src tests                # strict
+```
+
+Run them through the project's own environment so the `dev` extra is present:
+
+```bash
+uv run pytest
+# …or, after `uv sync --extra dev` and activating .venv:
+.venv/bin/python -m pytest
 ```
 
 The suite runs entirely offline. HTTP behaviour is exercised through `respx`,
 which defaults to `assert_all_mocked=True` — a request no test has routed raises
 rather than silently reaching the network. There are no live API calls and no
 credentials needed to run the tests.
+
+That ban is also enforced at the socket layer rather than trusted to `respx`
+alone: `tests/conftest.py` blocks name resolution and outbound connection
+(`socket.getaddrinfo`, `socket.connect`, `connect_ex` and `create_connection`)
+for every test, so a future edit that called `crawl()` outside a mocked context
+would fail loudly instead of spending real Apollo credits. A test that genuinely
+needs a socket opts out with `@pytest.mark.allow_network`.
+
+The suite is also hermetic against your shell: a `LEAD_*` variable exported in
+your terminal cannot change a test's behaviour, and tests write into a temporary
+directory rather than the repository's `data/`.
 
 Coverage is organized by the property each module is responsible for rather than
 by line count: registry extensibility, normalizer/validator edge cases, dedup
@@ -1031,9 +1168,53 @@ are the kind that would otherwise decay quietly:
 
 ---
 
+## Phase boundaries
+
+This repository is **Phase 1**, and it is deliberately narrow. The following are
+**not implemented, not stubbed, and not wired up**:
+
+| Not in Phase 1 | Why it is out of scope |
+| -------------- | ---------------------- |
+| **Cron scheduling** | The crawler runs when you invoke it and exits. There is no scheduler, no daemon and no background worker — scheduling presumes persisted runs to schedule *around* |
+| **MCP server** | No Model Context Protocol surface. The CLI is the only entry point |
+| **CRM integration** | No TinaCRM, Salesforce, HubSpot or any other sync. Export is a file, and the file is the hand-off |
+| **AI agent orchestration** | No LLM calls, no LangGraph, no n8n, no agent framework. Matching and inference are deterministic keyword and rule logic, so the same input always yields the same output |
+| **Email automation** | No outreach, no sequences, no sending of any kind. Phase 1 never contacts a lead, and normalizing an email address does not verify it — no mailbox is ever touched |
+| **Webhooks / background workers / VPS deployment** | Nothing runs unattended, and nothing pushes anywhere |
+
+Also out of scope, and worth being explicit about because they are adjacent:
+**persistence** (each run is independent; there is no state between runs) and
+**any write to a source** (only Apollo's people-search read path is used).
+
+**These are planned, not rejected.** Phase 1 was scoped this way so that the core
+— collection, normalization, validation, filtering, deduplication, export — is
+stable and tested before anything is layered on it. The extension points already
+exist and are load-bearing:
+
+- A **new source** is one module plus one `@register_crawler` decorator, with no
+  edit to the pipeline, the models or the CLI — see [Adding a new
+  crawler](#adding-a-new-crawler).
+- A **new output format** is one module plus one `@register_exporter` decorator.
+- **Deterministic `lead_id`s** mean a later phase can diff two runs (new /
+  changed / gone) rather than overwrite one.
+- **Exit codes and `--log-format json`** exist so a scheduler can branch on a run
+  without parsing prose.
+- **Per-record rejection reasons in the run report** exist so an automated pass
+  can explain a shortfall to a human.
+
+Each excluded capability has a natural landing place, roughly in dependency
+order: persistence first (something for a scheduled run to record into), then
+scheduling, then enrichment, then CRM sync, then outreach. See [Recommended next
+steps](#recommended-next-steps).
+
+---
+
 ## Known limitations
 
-Phase 1 is deliberately narrow. What it does **not** do:
+These are the edges of the crawler **as built** — capabilities that are in scope
+for Phase 1 but deliberately bounded. Whole capabilities excluded from Phase 1
+altogether (scheduling, MCP, CRM sync, agents, outreach) are listed separately
+under [Phase boundaries](#phase-boundaries).
 
 - **No Apollo writes, no enrichment.** Only the people-search read path is
   implemented; the key must have access to it. Apollo's people search does not
@@ -1072,8 +1253,11 @@ Phase 1 is deliberately narrow. What it does **not** do:
 - **Only one original value is preserved alongside its normalized form.** Job
   titles keep `job_title_raw` because trimming a trailing employer clause is
   lossy and the clause is often useful. Other fields keep only the normalized
-  value; the pre-normalization record survives solely in the `raw` payload of a
-  JSON/JSONL export.
+  value. `RawLead.raw` does preserve the untouched upstream payload, but it is an
+  adapter-level field — `StandardizedLead` does not carry it, so **it is not
+  present in any export**. What an export does carry is `normalization_issues`,
+  and only for values the normalizer could not read at all (not for values it
+  cleaned successfully).
 - **`aggressive` dedup can still over-merge.** It matches on full name + company
   domain, which collapses two genuinely different people who share a full name at
   one employer (`John Smith` twice at `acme.com`). Surname-only matching was
